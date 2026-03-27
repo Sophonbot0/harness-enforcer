@@ -1,7 +1,4 @@
 node_modules/
 dist/
 .DS_Store
-*.js
-*.d.ts
-*.js.map
-!openclaw.plugin.json
+runs/
