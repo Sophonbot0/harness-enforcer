@@ -205,6 +205,8 @@ All criteria verified.
     assert("Rejects missing planPath (thrown)", true);
   }
 
+  // ─── Progress Bar Tests ───
+
   // --- Test 12: renderProgressBar — 0% progress ---
   console.log("\n12. renderProgressBar — 0% progress");
   {
@@ -220,12 +222,12 @@ All criteria verified.
     });
     assert("Contains task description", output.includes("Implement progress bar"));
     assert("Contains 0%", output.includes("0%"));
-    assert("Contains empty bar (all ░)", output.includes("░".repeat(20)));
-    assert("No filled blocks", !output.includes("█"));
-    assert("Phase plan is current", output.includes("⏳ PLAN"));
-    assert("Phase build is pending", output.includes("⬜ BUILD"));
-    assert("Shows 0/10 DoD", output.includes("DoD: 0/10"));
-    assert("Shows 0s elapsed", output.includes("⏱ 0s"));
+    assert("Contains empty bar (all ▱)", output.includes("▱".repeat(BAR_WIDTH)));
+    assert("No filled blocks", !output.includes("▰"));
+    assert("Phase plan is current (▶)", output.includes("▶plan"));
+    assert("Phase build is pending (○)", output.includes("○build"));
+    assert("Shows 0/10 done", output.includes("0/10 done"));
+    assert("Shows 0s elapsed", output.includes("⏱0s"));
     assert("Pending features shown", output.includes("⬜ Feature A"));
     assert("Under 4096 chars", output.length <= 4096);
   }
@@ -245,15 +247,15 @@ All criteria verified.
       elapsedSeconds: 222,
     });
     assert("Contains 50%", output.includes("50%"));
-    assert("Contains filled blocks", output.includes("██████████"));
-    assert("Phase plan completed", output.includes("✅ PLAN"));
-    assert("Phase build is current", output.includes("⏳ BUILD"));
-    assert("Phase challenge pending", output.includes("⬜ CHALLENGE"));
+    assert("Contains filled blocks (▰)", output.includes("▰"));
+    assert("Phase plan completed (●)", output.includes("●plan"));
+    assert("Phase build is current (▶)", output.includes("▶build"));
+    assert("Phase challenge pending (○)", output.includes("○challenge"));
     assert("Completed features marked", output.includes("✅ Schema types"));
     assert("In-progress feature marked", output.includes("⏳ Integration tests"));
     assert("Pending feature marked", output.includes("⬜ Documentation"));
     assert("Elapsed formatted", output.includes("3m 42s"));
-    assert("Shows 5/10 DoD", output.includes("DoD: 5/10"));
+    assert("Shows 5/10 done", output.includes("5/10 done"));
     assert("In-progress not duplicated as pending",
       output.split("Integration tests").length - 1 === 1);
   }
@@ -272,12 +274,12 @@ All criteria verified.
       elapsedSeconds: 3661,
     });
     assert("Contains 100%", output.includes("100%"));
-    assert("Full bar (all █)", output.includes("█".repeat(20)));
-    assert("No empty blocks", !output.includes("░"));
-    assert("Eval phase current", output.includes("⏳ EVAL"));
-    assert("Shows 6/6 DoD", output.includes("DoD: 6/6"));
+    assert("Full bar (all ▰)", output.includes("▰".repeat(BAR_WIDTH)));
+    assert("No empty blocks", !output.includes("▱"));
+    assert("Eval phase current (▶)", output.includes("▶eval"));
+    assert("Shows 6/6 done", output.includes("6/6 done"));
     assert("Hours in elapsed", output.includes("1h 1m 1s"));
-    assert("Blockers: 0", output.includes("Blockers: 0"));
+    assert("Blockers: 0", output.includes("0 blockers"));
   }
 
   // --- Test 15: renderProgressBar — with blockers ---
@@ -293,7 +295,7 @@ All criteria verified.
       dodCompleted: 2,
       elapsedSeconds: 600,
     });
-    assert("Shows blocker count", output.includes("Blockers: 2"));
+    assert("Shows blocker count", output.includes("2 blockers"));
     assert("Shows blocker emoji", output.includes("🚫"));
     assert("Shows first blocker", output.includes("Database connection failing"));
     assert("Shows second blocker", output.includes("Missing API key"));
@@ -314,8 +316,7 @@ All criteria verified.
       elapsedSeconds: 5,
     });
     assert("Contains 0%", output.includes("0%"));
-    assert("Shows 0/0 DoD", output.includes("DoD: 0/0"));
-    assert("Features section present", output.includes("Features:"));
+    assert("Shows 0/0 done", output.includes("0/0 done"));
     assert("Under 4096 chars", output.length <= 4096);
   }
 
@@ -370,8 +371,8 @@ All criteria verified.
       dodCompleted: 1,
       elapsedSeconds: 30,
     });
-    assert("All phases shown as pending for unknown phase",
-      output.includes("⬜ PLAN") && output.includes("⬜ BUILD"));
+    assert("All phases shown as pending for unknown phase (○)",
+      output.includes("○plan") && output.includes("○build"));
     assert("Still renders valid output", output.includes("50%"));
   }
 
@@ -392,7 +393,8 @@ All criteria verified.
     assert("Shows DELIVERED", output.includes("✅ DELIVERED"));
     assert("Shows grade PASS", output.includes("Grade: PASS"));
     assert("Shows 100%", output.includes("100%"));
-    assert("Shows full bar", output.includes("█".repeat(20)));
+    assert("Shows full bar (▰)", output.includes("▰".repeat(BAR_WIDTH)));
+    assert("Shows DoD count", output.includes("DoD: 8/8"));
     assert("Under 4096 chars", output.length <= 4096);
   }
 
@@ -448,7 +450,7 @@ All criteria verified.
       elapsedSeconds: 0,
     });
     assert("Clamps to 100%", output.includes("100%"));
-    assert("Clamps dodCompleted to dodTotal", output.includes("DoD: 5/5"));
+    assert("Clamps dodCompleted to dodTotal", output.includes("5/5 done"));
   }
 
   // --- Test 24: Edge cases — negative elapsedSeconds ---
@@ -464,7 +466,187 @@ All criteria verified.
       dodCompleted: 0,
       elapsedSeconds: -100,
     });
-    assert("Handles negative elapsed gracefully", output.includes("⏱ 0s"));
+    assert("Handles negative elapsed gracefully", output.includes("⏱0s"));
+  }
+
+  // ─── Sprint-specific Tests ───
+
+  // --- Test 25: renderProgressBar — sprint mode, sprint 1/4 ---
+  console.log("\n25. renderProgressBar — sprint mode (sprint 1/4)");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Large project with sprints",
+      phase: "build",
+      completedFeatures: ["Schema types"],
+      pendingFeatures: ["API routes", "Auth middleware"],
+      inProgressFeature: "API routes",
+      blockers: [],
+      dodTotal: 10,
+      dodCompleted: 3,
+      elapsedSeconds: 300,
+      sprintCurrent: 1,
+      sprintTotal: 4,
+    });
+    assert("Shows sprint header", output.includes("📦 Sprint 1/4"));
+    assert("Shows task description", output.includes("Large project with sprints"));
+    assert("Shows phase indicator", output.includes("▶build"));
+    assert("Sprint status line: ⏳⬜⬜⬜", output.includes("⏳⬜⬜⬜"));
+    // Overall: (0 completed sprints * 100 + 30%) / 4 = 8%
+    assert("Overall percentage is 8%", output.includes("8%"));
+    assert("Shows completed feature", output.includes("✅ Schema types"));
+    assert("Shows in-progress feature", output.includes("⏳ API routes"));
+    assert("Shows pending feature", output.includes("⬜ Auth middleware"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 26: renderProgressBar — sprint mode, sprint 3/4 (midway) ---
+  console.log("\n26. renderProgressBar — sprint mode (sprint 3/4)");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Large project",
+      phase: "challenge",
+      completedFeatures: ["Notifications", "Search"],
+      pendingFeatures: ["File upload"],
+      blockers: [],
+      dodTotal: 12,
+      dodCompleted: 8,
+      elapsedSeconds: 7200,
+      sprintCurrent: 3,
+      sprintTotal: 4,
+    });
+    assert("Shows sprint 3/4", output.includes("📦 Sprint 3/4"));
+    assert("Sprint status: ✅✅⏳⬜", output.includes("✅✅⏳⬜"));
+    // Overall: (2 * 100 + 67%) / 4 = 67%
+    assert("Overall percentage is 67%", output.includes("67%"));
+    assert("Shows 2h elapsed", output.includes("2h 0m 0s"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 27: renderProgressBar — sprint mode, last sprint 100% ---
+  console.log("\n27. renderProgressBar — sprint mode (last sprint at 100%)");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Almost done",
+      phase: "eval",
+      completedFeatures: ["API docs", "Integration tests"],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 8,
+      dodCompleted: 8,
+      elapsedSeconds: 28800,
+      sprintCurrent: 4,
+      sprintTotal: 4,
+    });
+    assert("Shows sprint 4/4", output.includes("📦 Sprint 4/4"));
+    assert("Sprint status: ✅✅✅⏳", output.includes("✅✅✅⏳"));
+    // Overall: (3 * 100 + 100%) / 4 = 100%
+    assert("Overall percentage is 100%", output.includes("100%"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 28: renderProgressBar — no sprint params (backward compat) ---
+  console.log("\n28. renderProgressBar — no sprint params (backward compatible)");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Simple project",
+      phase: "build",
+      completedFeatures: ["Feature A"],
+      pendingFeatures: ["Feature B"],
+      blockers: [],
+      dodTotal: 4,
+      dodCompleted: 2,
+      elapsedSeconds: 120,
+    });
+    assert("No sprint header", !output.includes("📦 Sprint"));
+    assert("No sprint status line", !output.includes("⏳⬜"));
+    assert("Shows 50%", output.includes("50%"));
+    assert("Shows task description", output.includes("Simple project"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 29: renderFinalStatus — with sprint params ---
+  console.log("\n29. renderFinalStatus — with sprint params");
+  {
+    const output = renderFinalStatus({
+      taskDescription: "Sprint project completed",
+      status: "pass",
+      evalGrade: "PASS",
+      dodTotal: 45,
+      dodCompleted: 45,
+      elapsedSeconds: 28800,
+      completedFeatures: ["Schema", "Auth", "CRUD", "Notifications", "Dashboard"],
+      pendingFeatures: [],
+      blockers: [],
+      sprintCurrent: 6,
+      sprintTotal: 6,
+    });
+    assert("Shows DELIVERED", output.includes("✅ DELIVERED"));
+    assert("Shows sprint count", output.includes("📦 Sprints: 6/6 completed"));
+    assert("Shows DoD", output.includes("DoD: 45/45"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 30: renderFinalStatus — without sprint params (backward compat) ---
+  console.log("\n30. renderFinalStatus — without sprint params (backward compat)");
+  {
+    const output = renderFinalStatus({
+      taskDescription: "Simple completed",
+      status: "pass",
+      evalGrade: "PASS",
+      dodTotal: 8,
+      dodCompleted: 8,
+      elapsedSeconds: 600,
+      completedFeatures: ["A", "B"],
+      pendingFeatures: [],
+      blockers: [],
+    });
+    assert("Shows DELIVERED", output.includes("✅ DELIVERED"));
+    assert("No sprint line", !output.includes("📦 Sprints:"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 31: renderProgressBar — sprint mode with blockers ---
+  console.log("\n31. renderProgressBar — sprint mode with blockers");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Sprint with blockers",
+      phase: "build",
+      completedFeatures: [],
+      pendingFeatures: ["Feature X"],
+      blockers: ["Test failure"],
+      dodTotal: 5,
+      dodCompleted: 0,
+      elapsedSeconds: 100,
+      sprintCurrent: 2,
+      sprintTotal: 3,
+    });
+    assert("Shows sprint header", output.includes("📦 Sprint 2/3"));
+    assert("Shows blocker section", output.includes("⚠️ Blockers:"));
+    assert("Shows blocker detail", output.includes("Test failure"));
+    assert("Sprint status: ✅⏳⬜", output.includes("✅⏳⬜"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 32: renderFinalStatus — sprint mode fail ---
+  console.log("\n32. renderFinalStatus — sprint mode fail");
+  {
+    const output = renderFinalStatus({
+      taskDescription: "Sprint project failed",
+      status: "fail",
+      evalGrade: "FAIL",
+      dodTotal: 30,
+      dodCompleted: 15,
+      elapsedSeconds: 3600,
+      completedFeatures: ["A", "B"],
+      pendingFeatures: ["C", "D"],
+      blockers: ["Critical regression"],
+      sprintCurrent: 3,
+      sprintTotal: 5,
+    });
+    assert("Shows FAILED", output.includes("❌ FAILED"));
+    assert("Shows sprint count", output.includes("📦 Sprints: 3/5 completed"));
+    assert("Shows blocker", output.includes("Critical regression"));
+    assert("Under 4096 chars", output.length <= 4096);
   }
 
   // Summary
@@ -478,6 +660,9 @@ All criteria verified.
 
   process.exit(failed > 0 ? 1 : 0);
 }
+
+// BAR_WIDTH must match the constant in progress.ts
+const BAR_WIDTH = 15;
 
 main().catch((err) => {
   console.error("Test crashed:", err);

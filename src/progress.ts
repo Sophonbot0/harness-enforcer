@@ -20,6 +20,8 @@ export interface ProgressBarParams {
   dodTotal: number;
   dodCompleted: number;
   elapsedSeconds: number;
+  sprintCurrent?: number;  // e.g. 2 (1-indexed)
+  sprintTotal?: number;    // e.g. 4
 }
 
 function formatDuration(seconds: number): string {
@@ -86,6 +88,26 @@ function renderBlockers(blockers: string[]): string {
   return `\n⚠️ Blockers:\n${lines.join("\n")}`;
 }
 
+function renderSprintStatusLine(current: number, total: number): string {
+  const parts: string[] = [];
+  for (let i = 1; i <= total; i++) {
+    if (i < current) parts.push("✅");
+    else if (i === current) parts.push("⏳");
+    else parts.push("⬜");
+  }
+  return parts.join("");
+}
+
+function computeOverallPercentage(
+  sprintCurrent: number,
+  sprintTotal: number,
+  currentSprintPercentage: number,
+): number {
+  const completedSprints = sprintCurrent - 1;
+  const overall = (completedSprints * 100 + currentSprintPercentage) / sprintTotal;
+  return Math.round(Math.max(0, Math.min(100, overall)));
+}
+
 export function renderProgressBar(params: ProgressBarParams): string {
   const {
     taskDescription,
@@ -97,25 +119,42 @@ export function renderProgressBar(params: ProgressBarParams): string {
     dodTotal,
     dodCompleted,
     elapsedSeconds,
+    sprintCurrent,
+    sprintTotal,
   } = params;
 
   const safeDodTotal = Math.max(dodTotal, 0);
   const safeDodCompleted = Math.max(0, Math.min(dodCompleted, safeDodTotal));
-  const percentage = safeDodTotal === 0 ? 0 : Math.round((safeDodCompleted / safeDodTotal) * 100);
+  const sprintPercentage = safeDodTotal === 0 ? 0 : Math.round((safeDodCompleted / safeDodTotal) * 100);
 
-  const bar = renderBar(percentage);
+  const inSprintMode = sprintCurrent != null && sprintTotal != null && sprintTotal > 0;
+  const displayPercentage = inSprintMode
+    ? computeOverallPercentage(sprintCurrent!, sprintTotal!, sprintPercentage)
+    : sprintPercentage;
+
+  const bar = renderBar(displayPercentage);
   const phaseIndicator = renderPhaseIndicator(phase);
   const elapsed = formatDuration(elapsedSeconds);
   const featureList = renderFeatureList(completedFeatures, pendingFeatures, inProgressFeature);
   const blockerSection = renderBlockers(blockers);
 
-  const parts = [
-    `🔧 ${truncate(taskDescription, 80)}`,
-    `${phaseIndicator}`,
-    `${bar} ${percentage}% ⏱${elapsed}`,
-    featureList,
-    `${safeDodCompleted}/${safeDodTotal} done | ${blockers.length} blockers`,
-  ];
+  const parts: string[] = [];
+
+  if (inSprintMode) {
+    parts.push(`🔧 ${truncate(taskDescription, 80)}`);
+    parts.push(`📦 Sprint ${sprintCurrent}/${sprintTotal}`);
+    parts.push(`${phaseIndicator}`);
+    parts.push(`${bar} ${displayPercentage}% ⏱${elapsed}`);
+    parts.push(featureList);
+    parts.push(`${renderSprintStatusLine(sprintCurrent!, sprintTotal!)}`);
+    parts.push(`${safeDodCompleted}/${safeDodTotal} done | ${blockers.length} blockers`);
+  } else {
+    parts.push(`🔧 ${truncate(taskDescription, 80)}`);
+    parts.push(`${phaseIndicator}`);
+    parts.push(`${bar} ${displayPercentage}% ⏱${elapsed}`);
+    parts.push(featureList);
+    parts.push(`${safeDodCompleted}/${safeDodTotal} done | ${blockers.length} blockers`);
+  }
 
   if (blockerSection) {
     parts.push(blockerSection);
@@ -141,6 +180,8 @@ export function renderFinalStatus(params: {
   completedFeatures: string[];
   pendingFeatures: string[];
   blockers: string[];
+  sprintCurrent?: number;
+  sprintTotal?: number;
 }): string {
   const {
     taskDescription,
@@ -152,6 +193,8 @@ export function renderFinalStatus(params: {
     completedFeatures,
     pendingFeatures,
     blockers,
+    sprintCurrent,
+    sprintTotal,
   } = params;
 
   const safeDodTotal = Math.max(dodTotal, 0);
@@ -176,18 +219,26 @@ export function renderFinalStatus(params: {
   const featureList = renderFeatureList(completedFeatures, pendingFeatures);
   const blockerSection = renderBlockers(blockers);
 
+  const inSprintMode = sprintCurrent != null && sprintTotal != null && sprintTotal > 0;
+  const sprintLine = inSprintMode ? `📦 Sprints: ${sprintCurrent}/${sprintTotal} completed` : "";
+
   const parts = [
     `🔧 Harness: ${truncate(taskDescription, 80)}`,
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "",
     statusLine,
     `${bar} ${percentage}% ⏱${elapsed}`,
-    "",
-    "Features:",
-    featureList,
-    "",
-    `DoD: ${safeDodCompleted}/${safeDodTotal} ✅  |  Blockers: ${blockers.length}`,
   ];
+
+  if (inSprintMode) {
+    parts.push(sprintLine);
+  }
+
+  parts.push("");
+  parts.push("Features:");
+  parts.push(featureList);
+  parts.push("");
+  parts.push(`DoD: ${safeDodCompleted}/${safeDodTotal} ✅  |  Blockers: ${blockers.length}`);
 
   if (blockerSection) {
     parts.push(blockerSection);
