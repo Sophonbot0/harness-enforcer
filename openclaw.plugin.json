@@ -1,0 +1,21 @@
+{
+  "id": "harness-enforcer",
+  "uiHints": {
+    "runsDir": {
+      "label": "Runs Directory",
+      "help": "Directory where harness run state is persisted (default: ~/.openclaw/harness-enforcer/runs)"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "runsDir": {
+        "type": "string"
+      }
+    }
+  }
+}
