@@ -185,7 +185,7 @@ All criteria verified.
   // Path traversal
   try {
     const badStart = await startTool.execute("test-7a", {
-      planPath: "/Users/jbelo/.openclaw/../../../etc/passwd",
+      planPath: "/Users/testuser/.openclaw/../../../etc/passwd",
       taskDescription: "Should be rejected",
     });
     const badData = (badStart as any).details;

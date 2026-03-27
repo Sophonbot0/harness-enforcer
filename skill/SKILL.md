@@ -157,7 +157,7 @@ if (progress_made):
 
 if (no_progress AND same_items_stuck):
     STUCK → escalate to owner:
-    "João, estes items estão bloqueados após {n} tentativas:
+    "Owner, estes items estão bloqueados após {n} tentativas:
      - [item]: [razão]. Tentei [approach1] e [approach2].
      Precisas de intervir ou queres que tente uma abordagem diferente?"
 
