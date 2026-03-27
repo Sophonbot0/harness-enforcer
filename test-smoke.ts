@@ -11,6 +11,7 @@ import {
   createHarnessStatusTool,
   createHarnessResetTool,
 } from "./src/tools.js";
+import { renderProgressBar, renderFinalStatus } from "./src/progress.js";
 
 const testDir = path.join(os.tmpdir(), `harness-test-${Date.now()}`);
 const runsDir = path.join(testDir, "runs");
@@ -202,6 +203,268 @@ All criteria verified.
     assert("Rejects missing planPath", badData2?.error !== undefined);
   } catch {
     assert("Rejects missing planPath (thrown)", true);
+  }
+
+  // --- Test 12: renderProgressBar — 0% progress ---
+  console.log("\n12. renderProgressBar — 0% progress");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Implement progress bar",
+      phase: "plan",
+      completedFeatures: [],
+      pendingFeatures: ["Feature A", "Feature B", "Feature C"],
+      blockers: [],
+      dodTotal: 10,
+      dodCompleted: 0,
+      elapsedSeconds: 0,
+    });
+    assert("Contains task description", output.includes("Implement progress bar"));
+    assert("Contains 0%", output.includes("0%"));
+    assert("Contains empty bar (all ░)", output.includes("░".repeat(20)));
+    assert("No filled blocks", !output.includes("█"));
+    assert("Phase plan is current", output.includes("⏳ PLAN"));
+    assert("Phase build is pending", output.includes("⬜ BUILD"));
+    assert("Shows 0/10 DoD", output.includes("DoD: 0/10"));
+    assert("Shows 0s elapsed", output.includes("⏱ 0s"));
+    assert("Pending features shown", output.includes("⬜ Feature A"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 13: renderProgressBar — 50% progress ---
+  console.log("\n13. renderProgressBar — 50% progress");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Build API endpoint",
+      phase: "build",
+      completedFeatures: ["Schema types", "API endpoint"],
+      pendingFeatures: ["Integration tests", "Documentation"],
+      inProgressFeature: "Integration tests",
+      blockers: [],
+      dodTotal: 10,
+      dodCompleted: 5,
+      elapsedSeconds: 222,
+    });
+    assert("Contains 50%", output.includes("50%"));
+    assert("Contains filled blocks", output.includes("██████████"));
+    assert("Phase plan completed", output.includes("✅ PLAN"));
+    assert("Phase build is current", output.includes("⏳ BUILD"));
+    assert("Phase challenge pending", output.includes("⬜ CHALLENGE"));
+    assert("Completed features marked", output.includes("✅ Schema types"));
+    assert("In-progress feature marked", output.includes("⏳ Integration tests"));
+    assert("Pending feature marked", output.includes("⬜ Documentation"));
+    assert("Elapsed formatted", output.includes("3m 42s"));
+    assert("Shows 5/10 DoD", output.includes("DoD: 5/10"));
+    assert("In-progress not duplicated as pending",
+      output.split("Integration tests").length - 1 === 1);
+  }
+
+  // --- Test 14: renderProgressBar — 100% progress ---
+  console.log("\n14. renderProgressBar — 100% progress");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Complete task",
+      phase: "eval",
+      completedFeatures: ["Feature A", "Feature B"],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 6,
+      dodCompleted: 6,
+      elapsedSeconds: 3661,
+    });
+    assert("Contains 100%", output.includes("100%"));
+    assert("Full bar (all █)", output.includes("█".repeat(20)));
+    assert("No empty blocks", !output.includes("░"));
+    assert("Eval phase current", output.includes("⏳ EVAL"));
+    assert("Shows 6/6 DoD", output.includes("DoD: 6/6"));
+    assert("Hours in elapsed", output.includes("1h 1m 1s"));
+    assert("Blockers: 0", output.includes("Blockers: 0"));
+  }
+
+  // --- Test 15: renderProgressBar — with blockers ---
+  console.log("\n15. renderProgressBar — with blockers");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Task with blockers",
+      phase: "challenge",
+      completedFeatures: ["Done thing"],
+      pendingFeatures: ["Blocked thing"],
+      blockers: ["Database connection failing", "Missing API key"],
+      dodTotal: 4,
+      dodCompleted: 2,
+      elapsedSeconds: 600,
+    });
+    assert("Shows blocker count", output.includes("Blockers: 2"));
+    assert("Shows blocker emoji", output.includes("🚫"));
+    assert("Shows first blocker", output.includes("Database connection failing"));
+    assert("Shows second blocker", output.includes("Missing API key"));
+    assert("Shows warning section", output.includes("⚠️ Blockers:"));
+  }
+
+  // --- Test 16: renderProgressBar — empty features ---
+  console.log("\n16. renderProgressBar — empty features");
+  {
+    const output = renderProgressBar({
+      taskDescription: "No features yet",
+      phase: "plan",
+      completedFeatures: [],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 0,
+      dodCompleted: 0,
+      elapsedSeconds: 5,
+    });
+    assert("Contains 0%", output.includes("0%"));
+    assert("Shows 0/0 DoD", output.includes("DoD: 0/0"));
+    assert("Features section present", output.includes("Features:"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 17: renderProgressBar — very long feature names ---
+  console.log("\n17. renderProgressBar — very long feature names (truncation)");
+  {
+    const longName = "A".repeat(100);
+    const output = renderProgressBar({
+      taskDescription: "T".repeat(200),
+      phase: "build",
+      completedFeatures: [longName],
+      pendingFeatures: [longName, longName],
+      blockers: [longName],
+      dodTotal: 3,
+      dodCompleted: 1,
+      elapsedSeconds: 10,
+    });
+    assert("Task description truncated", !output.includes("T".repeat(100)));
+    assert("Contains truncation char", output.includes("…"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 18: renderProgressBar — 10 features (Telegram limit) ---
+  console.log("\n18. renderProgressBar — 10 features (Telegram limit)");
+  {
+    const features = Array.from({ length: 10 }, (_, i) => `Feature ${i + 1}: Something descriptive here`);
+    const output = renderProgressBar({
+      taskDescription: "Large feature set",
+      phase: "build",
+      completedFeatures: features.slice(0, 5),
+      pendingFeatures: features.slice(5),
+      blockers: ["Blocker 1", "Blocker 2", "Blocker 3"],
+      dodTotal: 30,
+      dodCompleted: 15,
+      elapsedSeconds: 1800,
+    });
+    assert("Under 4096 chars with 10 features", output.length <= 4096);
+    assert("All completed features present", features.slice(0, 5).every(f => output.includes(f)));
+    assert("All pending features present", features.slice(5).every(f => output.includes(f)));
+  }
+
+  // --- Test 19: renderProgressBar — unknown phase ---
+  console.log("\n19. renderProgressBar — unknown phase");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Custom phase",
+      phase: "deploy",
+      completedFeatures: ["A"],
+      pendingFeatures: ["B"],
+      blockers: [],
+      dodTotal: 2,
+      dodCompleted: 1,
+      elapsedSeconds: 30,
+    });
+    assert("All phases shown as pending for unknown phase",
+      output.includes("⬜ PLAN") && output.includes("⬜ BUILD"));
+    assert("Still renders valid output", output.includes("50%"));
+  }
+
+  // --- Test 20: renderFinalStatus — pass ---
+  console.log("\n20. renderFinalStatus — pass");
+  {
+    const output = renderFinalStatus({
+      taskDescription: "Completed task",
+      status: "pass",
+      evalGrade: "PASS",
+      dodTotal: 8,
+      dodCompleted: 8,
+      elapsedSeconds: 900,
+      completedFeatures: ["Feature X", "Feature Y"],
+      pendingFeatures: [],
+      blockers: [],
+    });
+    assert("Shows DELIVERED", output.includes("✅ DELIVERED"));
+    assert("Shows grade PASS", output.includes("Grade: PASS"));
+    assert("Shows 100%", output.includes("100%"));
+    assert("Shows full bar", output.includes("█".repeat(20)));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 21: renderFinalStatus — fail ---
+  console.log("\n21. renderFinalStatus — fail");
+  {
+    const output = renderFinalStatus({
+      taskDescription: "Failed task",
+      status: "fail",
+      evalGrade: "FAIL",
+      dodTotal: 8,
+      dodCompleted: 3,
+      elapsedSeconds: 1200,
+      completedFeatures: ["Feature X"],
+      pendingFeatures: ["Feature Y", "Feature Z"],
+      blockers: ["Critical bug"],
+    });
+    assert("Shows FAILED", output.includes("❌ FAILED"));
+    assert("Shows grade FAIL", output.includes("Grade: FAIL"));
+    assert("Shows partial progress", output.includes("38%"));
+    assert("Shows blocker", output.includes("Critical bug"));
+  }
+
+  // --- Test 22: renderFinalStatus — cancelled ---
+  console.log("\n22. renderFinalStatus — cancelled");
+  {
+    const output = renderFinalStatus({
+      taskDescription: "Cancelled task",
+      status: "cancelled",
+      dodTotal: 5,
+      dodCompleted: 2,
+      elapsedSeconds: 60,
+      completedFeatures: ["A"],
+      pendingFeatures: ["B", "C"],
+      blockers: [],
+    });
+    assert("Shows CANCELLED", output.includes("🚫 CANCELLED"));
+    assert("Shows partial progress", output.includes("40%"));
+    assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // --- Test 23: Edge cases — dodCompleted > dodTotal ---
+  console.log("\n23. Edge cases — dodCompleted > dodTotal");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Edge case",
+      phase: "eval",
+      completedFeatures: [],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 5,
+      dodCompleted: 10,
+      elapsedSeconds: 0,
+    });
+    assert("Clamps to 100%", output.includes("100%"));
+    assert("Clamps dodCompleted to dodTotal", output.includes("DoD: 5/5"));
+  }
+
+  // --- Test 24: Edge cases — negative elapsedSeconds ---
+  console.log("\n24. Edge cases — negative elapsedSeconds");
+  {
+    const output = renderProgressBar({
+      taskDescription: "Negative time",
+      phase: "plan",
+      completedFeatures: [],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 1,
+      dodCompleted: 0,
+      elapsedSeconds: -100,
+    });
+    assert("Handles negative elapsed gracefully", output.includes("⏱ 0s"));
   }
 
   // Summary
