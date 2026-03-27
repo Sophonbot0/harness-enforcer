@@ -25,6 +25,42 @@ const HARNESS_TOOLS = new Set([
   "harness_reset",
 ]);
 
+/**
+ * Extract Telegram chatId and threadId from an OpenClaw session key.
+ * 
+ * Session key formats:
+ *   agent:main:telegram:group:<chatId>:topic:<threadId>
+ *   agent:main:telegram:dm:<chatId>
+ *   agent:main:subagent:<uuid>  ← not telegram, skip
+ */
+function parseTelegramFromSessionKey(
+  sessionKey: string | undefined,
+): { chatId: string; threadId?: string } | null {
+  if (!sessionKey) return null;
+
+  // Forum group: agent:main:telegram:group:-1003868711850:topic:1
+  const forumMatch = sessionKey.match(
+    /telegram:group:([-\d]+):topic:(\d+)/,
+  );
+  if (forumMatch) {
+    return { chatId: forumMatch[1], threadId: forumMatch[2] };
+  }
+
+  // Regular group: agent:main:telegram:group:-1003868711850
+  const groupMatch = sessionKey.match(/telegram:group:([-\d]+)$/);
+  if (groupMatch) {
+    return { chatId: groupMatch[1] };
+  }
+
+  // DM: agent:main:telegram:dm:193902961
+  const dmMatch = sessionKey.match(/telegram:dm:([-\d]+)/);
+  if (dmMatch) {
+    return { chatId: dmMatch[1] };
+  }
+
+  return null;
+}
+
 export default {
   id: "harness-enforcer",
   name: "Harness Enforcer",
@@ -38,18 +74,21 @@ export default {
     api.registerTool(() => createHarnessResetTool(runsDir));
 
     // ─── Auto-update Telegram progress bar via after_tool_call hook ───
-    // This hook fires AFTER every tool call. When the tool is a harness_*
-    // tool that returned a progressBar + telegram info, we send/edit the
-    // Telegram message directly from the plugin — no agent cooperation needed.
-    api.on("after_tool_call", async (event) => {
+    //
+    // This hook fires AFTER every harness_* tool call. It:
+    // 1. Extracts chatId/threadId from the session key (no agent help needed)
+    // 2. Parses the progressBar from the tool result
+    // 3. Sends or edits the Telegram message directly via runtime API
+    //
+    // The agent doesn't need to do anything — the plugin handles it all.
+    api.on("after_tool_call", async (event, ctx) => {
       if (!HARNESS_TOOLS.has(event.toolName)) return;
 
-      // Parse the tool result to extract progressBar and telegram info
+      // Parse tool result to extract progressBar
       let payload: Record<string, unknown> | null = null;
       try {
         if (event.result && typeof event.result === "object") {
           const r = event.result as Record<string, unknown>;
-          // Tool results come as { content: [{type:"text", text:"..."}], details: {...} }
           if (r.details && typeof r.details === "object") {
             payload = r.details as Record<string, unknown>;
           } else if (r.content && Array.isArray(r.content)) {
@@ -62,51 +101,67 @@ export default {
           }
         }
       } catch {
-        // Parsing failed — skip silently
         return;
       }
 
       if (!payload?.progressBar || typeof payload.progressBar !== "string") return;
 
       const progressBar = payload.progressBar as string;
-      const telegramAction = payload.telegramAction as string | undefined;
-      const chatId = payload.telegramChatId as string | undefined;
-      const messageId = payload.telegramMessageId as string | undefined;
-      const threadId = payload.telegramThreadId as string | undefined;
 
-      if (!chatId) return;
+      // Resolve Telegram target from session key OR tool result
+      let chatId = payload.telegramChatId as string | undefined;
+      let threadId = payload.telegramThreadId as string | undefined;
+
+      if (!chatId) {
+        // Auto-detect from session key
+        const parsed = parseTelegramFromSessionKey(ctx.sessionKey);
+        if (parsed) {
+          chatId = parsed.chatId;
+          threadId = parsed.threadId;
+        }
+      }
+
+      if (!chatId) return; // Not a Telegram session — skip
+
+      // Get current run state for messageId
+      const active = state.findActiveRun(runsDir);
+      if (!active) return;
+
+      // Ensure telegram info is persisted in run state
+      if (!active.state.telegramChatId) {
+        active.state.telegramChatId = chatId;
+        if (threadId) active.state.telegramThreadId = threadId;
+        state.writeRunState(runsDir, active.runId, active.state);
+      }
 
       const sendMsg = api.runtime.channel.telegram.sendMessageTelegram;
       const editMsg = api.runtime.channel.telegram.conversationActions.editMessage;
+      const existingMessageId = active.state.telegramMessageId;
 
       try {
-        if (telegramAction === "send") {
-          // Initial send — store messageId in run state
+        if (!existingMessageId) {
+          // First call — send initial progress bar
           const result = await sendMsg(chatId, progressBar, {
             ...(threadId ? { messageThreadId: parseInt(threadId, 10) } : {}),
           });
           if (result?.messageId) {
-            // Persist the messageId back into the run state
-            const active = state.findActiveRun(runsDir);
-            if (active) {
-              active.state.telegramMessageId = String(result.messageId);
-              state.writeRunState(runsDir, active.runId, active.state);
-              api.logger.info(
-                `[harness-enforcer] Progress bar sent: messageId=${result.messageId} chatId=${chatId}`,
-              );
-            }
+            active.state.telegramMessageId = String(result.messageId);
+            state.writeRunState(runsDir, active.runId, active.state);
+            api.logger.info(
+              `[harness-enforcer] Progress bar sent: msgId=${result.messageId} chat=${chatId}`,
+            );
           }
-        } else if (telegramAction === "edit" && messageId) {
-          // Edit existing message
-          await editMsg(chatId, messageId, progressBar);
+        } else {
+          // Subsequent calls — edit existing message
+          await editMsg(chatId, existingMessageId, progressBar);
           api.logger.info(
-            `[harness-enforcer] Progress bar updated: messageId=${messageId} chatId=${chatId}`,
+            `[harness-enforcer] Progress bar updated: msgId=${existingMessageId} chat=${chatId}`,
           );
         }
       } catch (err) {
         // Best-effort — never block the pipeline
         api.logger.warn(
-          `[harness-enforcer] Failed to update Telegram progress bar: ${
+          `[harness-enforcer] Telegram progress update failed: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
