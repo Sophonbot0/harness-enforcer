@@ -12,6 +12,7 @@ The harness-enforcer plugin provides 4 tools that enforce quality gates during d
 | `harness_checkpoint` | Save progress to disk (survives context compaction) |
 | `harness_submit` | Quality gate — validates eval PASS + DoD checked + no unresolved CRITICALs |
 | `harness_status` | Inspect active/past runs, view progress and grades |
+| `harness_reset` | Cancel the active run, mark as cancelled, allow a fresh `harness_start` |
 
 ## Key Features
 

@@ -6,6 +6,7 @@ import {
   createHarnessCheckpointTool,
   createHarnessSubmitTool,
   createHarnessStatusTool,
+  createHarnessResetTool,
 } from "./src/tools.js";
 
 function resolveRunsDir(api: OpenClawPluginApi): string {
@@ -26,5 +27,6 @@ export default {
     api.registerTool(() => createHarnessCheckpointTool(runsDir));
     api.registerTool(() => createHarnessSubmitTool(runsDir));
     api.registerTool(() => createHarnessStatusTool(runsDir));
+    api.registerTool(() => createHarnessResetTool(runsDir));
   },
 };

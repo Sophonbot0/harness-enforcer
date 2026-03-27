@@ -9,6 +9,7 @@ import {
   createHarnessCheckpointTool,
   createHarnessSubmitTool,
   createHarnessStatusTool,
+  createHarnessResetTool,
 } from "./src/tools.js";
 
 const testDir = path.join(os.tmpdir(), `harness-test-${Date.now()}`);
@@ -135,8 +136,51 @@ All criteria verified.
   assert("Shows PASS grade", passData?.evalGrade === "PASS");
   assert("delivery.json exists", fs.existsSync(path.join(runDir, "delivery.json")));
 
-  // --- Test 7: Validation edge cases ---
-  console.log("\n7. Validation edge cases");
+  // --- Test 7: harness_reset (no active run) ---
+  console.log("\n7. harness_reset (no active run)");
+  const resetTool = createHarnessResetTool(runsDir);
+  const resetNoRun = await resetTool.execute("test-7a", {});
+  const resetNoRunData = (resetNoRun as any).details;
+  assert("Returns message when no active run", resetNoRunData?.message?.includes("No active"));
+
+  // --- Test 8: harness_reset (cancel active run) ---
+  console.log("\n8. harness_reset (cancel active run)");
+  // Start a new run first
+  fs.writeFileSync(planPath, `# Plan: Reset Test\n\n- [ ] Item A\n- [ ] Item B\n`);
+  const startForReset = await startTool.execute("test-8a", {
+    planPath,
+    taskDescription: "Run to be reset",
+  });
+  const resetRunId = (startForReset as any).details?.runId;
+  assert("New run started for reset test", typeof resetRunId === "string");
+
+  const resetResult = await resetTool.execute("test-8b", { reason: "Testing reset" });
+  const resetData = (resetResult as any).details;
+  assert("Reset returns success", resetData?.success === true);
+  assert("Reset returns correct runId", resetData?.runId === resetRunId);
+  assert("Reset returns reason", resetData?.reason === "Testing reset");
+  assert("Reset returns cancelledAt", typeof resetData?.cancelledAt === "string");
+
+  // --- Test 9: harness_start works after reset ---
+  console.log("\n9. harness_start after reset");
+  const startAfterReset = await startTool.execute("test-9", {
+    planPath,
+    taskDescription: "Fresh start after reset",
+  });
+  const afterResetData = (startAfterReset as any).details;
+  assert("Start succeeds after reset", afterResetData?.success === true);
+  assert("New runId is different", afterResetData?.runId !== resetRunId);
+
+  // --- Test 10: harness_status shows cancelled run ---
+  console.log("\n10. harness_status shows cancelled run");
+  // First cancel this new run too so we can check status
+  await resetTool.execute("test-10a", {});
+  const statusAfterReset = await statusTool.execute("test-10b", { runId: resetRunId });
+  const statusResetData = (statusAfterReset as any).details;
+  assert("Cancelled run shows status=cancelled", statusResetData?.status === "cancelled");
+
+  // --- Test 11: Validation edge cases ---
+  console.log("\n11. Validation edge cases");
   // Path traversal
   try {
     const badStart = await startTool.execute("test-7a", {

@@ -358,6 +358,71 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
 
 // ─── harness_status ───
 
+export function createHarnessResetTool(runsDir: string): AnyAgentTool {
+  return {
+    name: "harness_reset",
+    label: "Harness Reset",
+    description:
+      "Cancel the active harness run and reset state, allowing a fresh start. " +
+      "Marks the run as 'cancelled' (preserves history) rather than deleting files. " +
+      "After reset, harness_start can be called again.",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description: "Optional reason for cancelling the run (e.g. 'requirements changed', 'stuck on blockers').",
+        },
+      },
+      required: [],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const p = params as Record<string, unknown>;
+        const reason = validation.readOptionalStringParam(p, "reason") ?? "Manual reset";
+
+        const active = state.findActiveRun(runsDir);
+        if (!active) {
+          return jsonResult({
+            message: "No active harness run to reset.",
+            hint: "There is no active run. You can call harness_start to begin a new one.",
+          });
+        }
+
+        const { runId, state: runState } = active;
+
+        const result = state.withLock(runId, () => {
+          const elapsed = elapsedSeconds(runState.startedAt);
+          const checkpoints = state.readCheckpoints(runsDir, runId);
+
+          runState.status = "cancelled";
+          state.writeRunState(runsDir, runId, runState);
+
+          return {
+            success: true,
+            runId,
+            cancelledAt: new Date().toISOString(),
+            reason,
+            elapsed: formatDuration(elapsed),
+            elapsedSeconds: elapsed,
+            phase: runState.phase,
+            checkpointCount: checkpoints.length,
+            message: `Run '${runId}' cancelled. You can now call harness_start to begin a fresh run.`,
+          };
+        });
+
+        return jsonResult(result);
+      } catch (err) {
+        return jsonResult({
+          error: `harness_reset failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    },
+  };
+}
+
+// ─── harness_status ───
+
 export function createHarnessStatusTool(runsDir: string): AnyAgentTool {
   return {
     name: "harness_status",

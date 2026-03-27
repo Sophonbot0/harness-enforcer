@@ -10,7 +10,7 @@ export interface RunState {
   phase: string;
   round: number;
   checkpoints: string[];
-  status: "active" | "completed" | "failed";
+  status: "active" | "completed" | "failed" | "cancelled";
 }
 
 export interface Checkpoint {
@@ -105,7 +105,9 @@ export function ensureDir(dir: string): void {
 }
 
 export function generateRunId(): string {
-  return new Date().toISOString().replace(/[:.]/g, "-");
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${ts}-${rand}`;
 }
 
 export function getRunDir(runsDir: string, runId: string): string {
