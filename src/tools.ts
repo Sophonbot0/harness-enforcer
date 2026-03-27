@@ -213,6 +213,9 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
 
         const { runId, state: runState } = active;
 
+        // Resolve telegramMessageId: param > state > null
+        const resolvedMessageId = telegramMessageId ?? runState.telegramMessageId;
+
         // Save telegramMessageId if provided and not already set
         if (telegramMessageId && !runState.telegramMessageId) {
           runState.telegramMessageId = telegramMessageId;
@@ -264,7 +267,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           };
 
           // Include Telegram edit instructions if we have the info
-          const msgId = runState.telegramMessageId ?? telegramMessageId;
+          const msgId = resolvedMessageId;
           if (msgId && runState.telegramChatId) {
             res.telegramAction = "edit";
             res.telegramMessageId = msgId;
