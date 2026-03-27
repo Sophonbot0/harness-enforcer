@@ -11,6 +11,9 @@ export interface RunState {
   round: number;
   checkpoints: string[];
   status: "active" | "completed" | "failed" | "cancelled";
+  telegramChatId?: string;
+  telegramThreadId?: string;
+  telegramMessageId?: string;
 }
 
 export interface Checkpoint {

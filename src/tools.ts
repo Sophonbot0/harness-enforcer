@@ -1,6 +1,7 @@
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import * as state from "./state.js";
 import * as validation from "./validation.js";
+import { renderProgressBar, renderFinalStatus } from "./progress.js";
 
 function jsonResult(payload: unknown): {
   content: Array<{ type: "text"; text: string }>;
@@ -42,6 +43,14 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Short description of the task being executed.",
         },
+        telegramChatId: {
+          type: "string",
+          description: "Telegram chat ID for progress bar auto-updates. If set, the tool returns a rendered progress bar to send.",
+        },
+        telegramThreadId: {
+          type: "string",
+          description: "Telegram thread/topic ID for progress bar auto-updates (optional, for forum groups).",
+        },
       },
       required: ["planPath", "taskDescription"],
     },
@@ -79,6 +88,9 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
         const runId = state.generateRunId();
         const now = new Date().toISOString();
 
+        const telegramChatId = validation.readOptionalStringParam(p, "telegramChatId");
+        const telegramThreadId = validation.readOptionalStringParam(p, "telegramThreadId");
+
         const runState: state.RunState = {
           runId,
           planPath,
@@ -88,6 +100,8 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           round: 1,
           checkpoints: [],
           status: "active",
+          ...(telegramChatId ? { telegramChatId } : {}),
+          ...(telegramThreadId ? { telegramThreadId } : {}),
         };
 
         state.writeRunState(runsDir, runId, runState);
@@ -97,7 +111,19 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           dodItems.map((d) => ({ text: d.text, checked: d.checked })),
         );
 
-        return jsonResult({
+        // Auto-render initial progress bar
+        const progressBar = renderProgressBar({
+          taskDescription,
+          phase: "plan",
+          completedFeatures: [],
+          pendingFeatures: [],
+          blockers: [],
+          dodTotal: dodItems.length,
+          dodCompleted: 0,
+          elapsedSeconds: 0,
+        });
+
+        const result: Record<string, unknown> = {
           success: true,
           runId,
           startedAt: now,
@@ -105,7 +131,17 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           taskDescription,
           dodItemCount: dodItems.length,
           uncheckedDodItems: dodItems.filter((d) => !d.checked).length,
-        });
+          progressBar,
+        };
+
+        if (telegramChatId) {
+          result.telegramAction = "send";
+          result.telegramChatId = telegramChatId;
+          if (telegramThreadId) result.telegramThreadId = telegramThreadId;
+          result.telegramInstructions = "Send progressBar as a Telegram message using 'message action=send'. Save the returned messageId and pass it to harness_checkpoint as telegramMessageId.";
+        }
+
+        return jsonResult(result);
       } catch (err) {
         return jsonResult({
           error: `harness_start failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -150,6 +186,10 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Brief summary of progress at this checkpoint.",
         },
+        telegramMessageId: {
+          type: "string",
+          description: "Telegram message ID to edit with updated progress bar. Pass the messageId from harness_start's initial send.",
+        },
       },
       required: ["phase", "completedFeatures", "pendingFeatures", "blockers", "summary"],
     },
@@ -161,6 +201,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
         const pendingFeatures = validation.readStringArrayParam(p, "pendingFeatures");
         const blockers = validation.readStringArrayParam(p, "blockers");
         const summary = validation.readStringParam(p, "summary");
+        const telegramMessageId = validation.readOptionalStringParam(p, "telegramMessageId");
 
         const active = state.findActiveRun(runsDir);
         if (!active) {
@@ -171,6 +212,11 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
         }
 
         const { runId, state: runState } = active;
+
+        // Save telegramMessageId if provided and not already set
+        if (telegramMessageId && !runState.telegramMessageId) {
+          runState.telegramMessageId = telegramMessageId;
+        }
 
         // Use lock for state mutation
         const result = state.withLock(runId, () => {
@@ -190,7 +236,21 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           state.appendCheckpoint(runsDir, runId, checkpoint);
 
           const elapsed = elapsedSeconds(runState.startedAt);
-          return {
+          const dodItems = state.readDodItems(runsDir, runId);
+
+          // Auto-render progress bar
+          const progressBar = renderProgressBar({
+            taskDescription: runState.taskDescription,
+            phase,
+            completedFeatures,
+            pendingFeatures,
+            blockers,
+            dodTotal: dodItems.length,
+            dodCompleted: completedFeatures.length,
+            elapsedSeconds: elapsed,
+          });
+
+          const res: Record<string, unknown> = {
             success: true,
             runId,
             checkpointNumber: runState.checkpoints.length,
@@ -200,7 +260,20 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             completedCount: completedFeatures.length,
             pendingCount: pendingFeatures.length,
             blockerCount: blockers.length,
+            progressBar,
           };
+
+          // Include Telegram edit instructions if we have the info
+          const msgId = runState.telegramMessageId ?? telegramMessageId;
+          if (msgId && runState.telegramChatId) {
+            res.telegramAction = "edit";
+            res.telegramMessageId = msgId;
+            res.telegramChatId = runState.telegramChatId;
+            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
+            res.telegramInstructions = "Edit the Telegram message using: message action=edit messageId=<telegramMessageId> target=<telegramChatId> message=<progressBar>";
+          }
+
+          return res;
         });
 
         return jsonResult(result);
@@ -315,6 +388,7 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
         const result = state.withLock(runId, () => {
           const elapsed = elapsedSeconds(runState.startedAt);
           const checkpoints = state.readCheckpoints(runsDir, runId);
+          const lastCheckpoint = checkpoints.length > 0 ? checkpoints[checkpoints.length - 1] : null;
 
           let evalGrade = "PASS";
           if (evalContent) {
@@ -334,7 +408,21 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
           state.writeRunState(runsDir, runId, runState);
           state.writeDelivery(runsDir, runId, delivery);
 
-          return {
+          // Auto-render final status bar
+          const dodItems = state.readDodItems(runsDir, runId);
+          const progressBar = renderFinalStatus({
+            taskDescription: runState.taskDescription,
+            status: "pass",
+            evalGrade,
+            dodTotal: dodItems.length,
+            dodCompleted: lastCheckpoint ? lastCheckpoint.completedFeatures.length : dodItems.length,
+            elapsedSeconds: elapsed,
+            completedFeatures: lastCheckpoint ? lastCheckpoint.completedFeatures : [],
+            pendingFeatures: lastCheckpoint ? lastCheckpoint.pendingFeatures : [],
+            blockers: lastCheckpoint ? lastCheckpoint.blockers : [],
+          });
+
+          const res: Record<string, unknown> = {
             delivered: true,
             runId,
             evalGrade,
@@ -343,7 +431,19 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
             elapsedSeconds: elapsed,
             checkpointCount: checkpoints.length,
             message: "All quality gates passed. Run delivered successfully.",
+            progressBar,
           };
+
+          // Include Telegram edit instructions
+          if (runState.telegramMessageId && runState.telegramChatId) {
+            res.telegramAction = "edit";
+            res.telegramMessageId = runState.telegramMessageId;
+            res.telegramChatId = runState.telegramChatId;
+            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
+            res.telegramInstructions = "Edit the Telegram message with the final DELIVERED status using: message action=edit";
+          }
+
+          return res;
         });
 
         return jsonResult(result);
@@ -394,11 +494,24 @@ export function createHarnessResetTool(runsDir: string): AnyAgentTool {
         const result = state.withLock(runId, () => {
           const elapsed = elapsedSeconds(runState.startedAt);
           const checkpoints = state.readCheckpoints(runsDir, runId);
+          const lastCheckpoint = checkpoints.length > 0 ? checkpoints[checkpoints.length - 1] : null;
 
           runState.status = "cancelled";
           state.writeRunState(runsDir, runId, runState);
 
-          return {
+          // Auto-render final status bar
+          const progressBar = renderFinalStatus({
+            taskDescription: runState.taskDescription,
+            status: "cancelled",
+            dodTotal: state.readDodItems(runsDir, runId).length,
+            dodCompleted: lastCheckpoint ? lastCheckpoint.completedFeatures.length : 0,
+            elapsedSeconds: elapsed,
+            completedFeatures: lastCheckpoint ? lastCheckpoint.completedFeatures : [],
+            pendingFeatures: lastCheckpoint ? lastCheckpoint.pendingFeatures : [],
+            blockers: lastCheckpoint ? lastCheckpoint.blockers : [],
+          });
+
+          const res: Record<string, unknown> = {
             success: true,
             runId,
             cancelledAt: new Date().toISOString(),
@@ -408,7 +521,19 @@ export function createHarnessResetTool(runsDir: string): AnyAgentTool {
             phase: runState.phase,
             checkpointCount: checkpoints.length,
             message: `Run '${runId}' cancelled. You can now call harness_start to begin a fresh run.`,
+            progressBar,
           };
+
+          // Include Telegram edit instructions
+          if (runState.telegramMessageId && runState.telegramChatId) {
+            res.telegramAction = "edit";
+            res.telegramMessageId = runState.telegramMessageId;
+            res.telegramChatId = runState.telegramChatId;
+            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
+            res.telegramInstructions = "Edit the Telegram message with the final cancelled status using: message action=edit";
+          }
+
+          return res;
         });
 
         return jsonResult(result);

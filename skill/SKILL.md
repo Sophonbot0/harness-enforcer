@@ -328,59 +328,29 @@ Edit the progress message at ALL of these moments:
 
 **Minimum 8 updates per harness cycle.** On multi-round runs (eval FAIL → retry), updates happen again for each BUILD→CHALLENGE→EVAL round.
 
-### Flow
+### Flow — Plugin-Assisted Auto-Updates
 
-1. **After `harness_start`:** Send the initial progress message and **save the `messageId`**:
-```
-message action=send → capture messageId
-```
+The plugin now auto-renders the progress bar. Every tool response includes a `progressBar` field with the rendered text.
 
-2. **Before EVERY subagent spawn AND after EVERY subagent completion:** Edit with current state:
-```
-message action=edit messageId=<saved_id>
-```
+1. **`harness_start` with `telegramChatId` + `telegramThreadId`:**
+   - Returns `progressBar` + `telegramAction: "send"`
+   - Agent sends it via `message action=send` and captures `messageId`
+   - Agent passes `messageId` to the first `harness_checkpoint` call
 
-3. **After `harness_submit`/`harness_reset`:** Edit with final status.
+2. **Every `harness_checkpoint` call (with `telegramMessageId`):**
+   - Returns auto-rendered `progressBar` + `telegramAction: "edit"`
+   - Agent edits the message using the returned `progressBar` text and `telegramMessageId`
+   - **Call checkpoint at EVERY phase transition** — before and after each subagent spawn/completion
 
-### How to track progress between updates
+3. **`harness_submit` / `harness_reset`:**
+   - Returns `progressBar` with final status (DELIVERED/FAILED/CANCELLED)
+   - Agent edits one last time
 
-You don't need `harness_checkpoint` to update the bar. Track state yourself:
-- After planner completes: you know features from plan.md → show them as ⬜
-- After generator completes: mark features as ✅ based on generator's summary
-- After adversary completes: keep features as ✅, update phase
-- After evaluator completes: show PASS/FAIL result
+**The agent's job is simple:** call `harness_checkpoint` frequently, then copy the `progressBar` from the response into a `message action=edit`. The plugin handles all rendering.
 
-Call `harness_checkpoint` for **persistence** (disk). Edit the message for **visibility** (Telegram). They are independent — do BOTH.
+### When to call harness_checkpoint
 
-### Rendering
-
-Use `renderProgressBar` from `harness-enforcer/src/progress.ts`:
-```
-renderProgressBar({
-  taskDescription,
-  phase,              // "plan" | "build" | "challenge" | "eval"
-  completedFeatures,
-  pendingFeatures,
-  inProgressFeature,  // the feature currently being worked on
-  blockers,
-  dodTotal,
-  dodCompleted,
-  elapsedSeconds,
-  sprintCurrent,      // optional: current sprint number
-  sprintTotal,        // optional: total sprints
-})
-```
-
-Use `renderFinalStatus` at the end:
-```
-renderFinalStatus({
-  taskDescription,
-  status: "pass" | "fail" | "cancelled",
-  evalGrade, dodTotal, dodCompleted, elapsedSeconds,
-  completedFeatures, pendingFeatures, blockers,
-  sprintCurrent, sprintTotal,
-})
-```
+Call `harness_checkpoint` at ALL of these moments:
 
 ### Rules
 
