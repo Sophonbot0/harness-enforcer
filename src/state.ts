@@ -11,6 +11,7 @@ export interface RunState {
   round: number;
   checkpoints: string[];
   status: "active" | "completed" | "failed" | "cancelled";
+  sessionKey?: string;  // Session that owns this run — enables concurrent runs
   telegramChatId?: string;
   telegramThreadId?: string;
   telegramMessageId?: string;
@@ -344,7 +345,7 @@ function readDelivery(runsDir: string, runId: string): Delivery | null {
   return safeParseJson<Delivery>(content, dp);
 }
 
-/** Find the active run, or null if none. */
+/** Find the active run, or null if none. Returns first active run (any session). */
 export function findActiveRun(runsDir: string): { runId: string; state: RunState } | null {
   if (!fs.existsSync(runsDir)) return null;
   const dirs = fs
@@ -364,6 +365,74 @@ export function findActiveRun(runsDir: string): { runId: string; state: RunState
     }
   }
   return null;
+}
+
+/**
+ * Find the active run for a specific session, or fall back to any unscoped active run.
+ * This enables concurrent runs across different sessions.
+ */
+export function findActiveRunForSession(
+  runsDir: string,
+  sessionKey: string | undefined,
+): { runId: string; state: RunState } | null {
+  if (!fs.existsSync(runsDir)) return null;
+  const dirs = fs
+    .readdirSync(runsDir)
+    .filter((d) => {
+      try { return fs.statSync(path.join(runsDir, d)).isDirectory(); } catch { return false; }
+    })
+    .sort()
+    .reverse();
+
+  // First pass: find an active run scoped to this session
+  if (sessionKey) {
+    for (const d of dirs) {
+      try {
+        const state = readRunState(runsDir, d);
+        if (state && state.status === "active" && state.sessionKey === sessionKey) {
+          return { runId: d, state };
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  // Second pass: find an active run with no session scope (legacy/unscoped)
+  for (const d of dirs) {
+    try {
+      const state = readRunState(runsDir, d);
+      if (state && state.status === "active" && !state.sessionKey) {
+        return { runId: d, state };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/** Get all active runs (for timer updates across sessions). */
+export function findAllActiveRuns(runsDir: string): Array<{ runId: string; state: RunState }> {
+  if (!fs.existsSync(runsDir)) return [];
+  const dirs = fs
+    .readdirSync(runsDir)
+    .filter((d) => {
+      try { return fs.statSync(path.join(runsDir, d)).isDirectory(); } catch { return false; }
+    })
+    .sort()
+    .reverse();
+  const results: Array<{ runId: string; state: RunState }> = [];
+  for (const d of dirs) {
+    try {
+      const state = readRunState(runsDir, d);
+      if (state && state.status === "active") results.push({ runId: d, state });
+    } catch {
+      continue;
+    }
+  }
+  return results;
 }
 
 /** Get the most recent run (any status). */

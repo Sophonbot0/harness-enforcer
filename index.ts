@@ -88,12 +88,16 @@ export default {
   register(api: OpenClawPluginApi) {
     const runsDir = resolveRunsDir(api);
 
-    api.registerTool(() => createHarnessStartTool(runsDir));
-    api.registerTool(() => createHarnessCheckpointTool(runsDir));
-    api.registerTool(() => createHarnessSubmitTool(runsDir));
-    api.registerTool(() => createHarnessStatusTool(runsDir));
-    api.registerTool(() => createHarnessResetTool(runsDir));
-    api.registerTool(() => createHarnessResumeTool(runsDir));
+    // Session context holder — set by before_tool_call, read by tools
+    // This allows tools to know which session is calling them
+    const sessionContext = { currentSessionKey: undefined as string | undefined };
+
+    api.registerTool(() => createHarnessStartTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessCheckpointTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessSubmitTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessStatusTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessResetTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessResumeTool(runsDir, sessionContext));
 
     // ─── Helpers ───
 
@@ -352,23 +356,29 @@ export default {
       if (now - lastStaleCheckMs < STALE_CHECK_INTERVAL_MS) return;
       lastStaleCheckMs = now;
 
-      const active = state.findActiveRun(runsDir);
-      if (!active) return;
+      // Check ALL active runs for staleness (supports concurrent runs)
+      const activeRuns = state.findAllActiveRuns(runsDir);
+      for (const active of activeRuns) {
+        const checkpoints = state.readCheckpoints(runsDir, active.runId);
+        const lastActivity = checkpoints.length > 0
+          ? new Date(checkpoints[checkpoints.length - 1].timestamp).getTime()
+          : new Date(active.state.startedAt).getTime();
 
-      const checkpoints = state.readCheckpoints(runsDir, active.runId);
-      const lastActivity = checkpoints.length > 0
-        ? new Date(checkpoints[checkpoints.length - 1].timestamp).getTime()
-        : new Date(active.state.startedAt).getTime();
+        const sinceLastActivity = now - lastActivity;
 
-      const sinceLastActivity = now - lastActivity;
-
-      if (sinceLastActivity > STALE_RUN_TIMEOUT_MS) {
-        await autoCancel(
-          active,
-          `Stale run: ${Math.round(sinceLastActivity / 60000)}min since last checkpoint (limit: ${STALE_RUN_TIMEOUT_MS / 60000}min)`,
-        );
+        if (sinceLastActivity > STALE_RUN_TIMEOUT_MS) {
+          await autoCancel(
+            active,
+            `Stale run: ${Math.round(sinceLastActivity / 60000)}min since last checkpoint (limit: ${STALE_RUN_TIMEOUT_MS / 60000}min)`,
+          );
+        }
       }
     }
+
+    // ─── HOOK 0: before_tool_call — set session context for tools ───
+    api.on("before_tool_call", async (_event, ctx) => {
+      sessionContext.currentSessionKey = ctx.sessionKey;
+    });
 
     // ─── HOOK 1: after_tool_call — main orchestrator ───
     api.on("after_tool_call", async (event, ctx) => {
@@ -397,8 +407,8 @@ export default {
       // ── Stale run check (every 5min) ──
       await checkStaleRun();
 
-      // ── Watchdog checks (only during active runs) ──
-      const activeForWatchdog = state.findActiveRun(runsDir);
+      // ── Watchdog checks (only during active runs for this session) ──
+      const activeForWatchdog = state.findActiveRunForSession(runsDir, ctx.sessionKey);
       if (activeForWatchdog && !HARNESS_TOOLS.has(event.toolName)) {
         // Track file edits
         trackFileEdit(event.toolName, event.arguments);
@@ -514,14 +524,14 @@ export default {
         if (!chatId) return;
 
         // For harness_submit / harness_reset, the run may already be completed/cancelled
-        // so findActiveRun won't find it. Use payload fields + fallback to active run.
+        // so findActiveRunForSession won't find it. Use payload fields + fallback.
         const messageId = payload.telegramMessageId as string | undefined;
         const runId = payload.runId as string | undefined;
 
-        // Try active run first, then fall back to reading the specific run from payload
+        // Try session-scoped active run first, then fall back to reading the specific run from payload
         let runState: state.RunState | null = null;
         let resolvedRunId: string | undefined;
-        const active = state.findActiveRun(runsDir);
+        const active = state.findActiveRunForSession(runsDir, ctx.sessionKey);
         if (active) {
           runState = active.state;
           resolvedRunId = active.runId;
@@ -569,24 +579,25 @@ export default {
       }
 
       // ── For ANY other tool: throttled timer update (every 30s) ──
+      // Update the progress bar for THIS session's active run
       const now = Date.now();
       if (now - lastTimerUpdateMs < TIMER_UPDATE_INTERVAL_MS) return;
 
-      const active = state.findActiveRun(runsDir);
-      if (!active) return;
-      if (!active.state.telegramMessageId || !active.state.telegramChatId)
+      const activeForTimer = state.findActiveRunForSession(runsDir, ctx.sessionKey);
+      if (!activeForTimer) return;
+      if (!activeForTimer.state.telegramMessageId || !activeForTimer.state.telegramChatId)
         return;
 
-      const progressBar = buildTimerProgressBar(active);
+      const progressBar = buildTimerProgressBar(activeForTimer);
 
       const ok = await editProgressBar(
-        active.state.telegramChatId,
-        active.state.telegramMessageId,
+        activeForTimer.state.telegramChatId,
+        activeForTimer.state.telegramMessageId,
         progressBar,
       );
       if (!ok) {
-        active.state.telegramMessageId = undefined;
-        state.writeRunState(runsDir, active.runId, active.state);
+        activeForTimer.state.telegramMessageId = undefined;
+        state.writeRunState(runsDir, activeForTimer.runId, activeForTimer.state);
       }
 
       lastTimerUpdateMs = now;
@@ -597,32 +608,31 @@ export default {
 
     // ─── HOOK 2: Subagent lifecycle → immediate update ───
     api.on("subagent_spawned", async (_event, _ctx) => {
-      const active = state.findActiveRun(runsDir);
-      if (!active) return;
-      if (!active.state.telegramMessageId || !active.state.telegramChatId)
-        return;
-
-      const progressBar = buildTimerProgressBar(active);
-      await editProgressBar(
-        active.state.telegramChatId,
-        active.state.telegramMessageId,
-        progressBar,
-      );
+      // Update all active runs (subagents may belong to any session)
+      const activeRuns = state.findAllActiveRuns(runsDir);
+      for (const active of activeRuns) {
+        if (!active.state.telegramMessageId || !active.state.telegramChatId) continue;
+        const progressBar = buildTimerProgressBar(active);
+        await editProgressBar(
+          active.state.telegramChatId,
+          active.state.telegramMessageId,
+          progressBar,
+        );
+      }
       lastTimerUpdateMs = Date.now();
     });
 
     api.on("subagent_ended", async (_event, _ctx) => {
-      const active = state.findActiveRun(runsDir);
-      if (!active) return;
-      if (!active.state.telegramMessageId || !active.state.telegramChatId)
-        return;
-
-      const progressBar = buildTimerProgressBar(active);
-      await editProgressBar(
-        active.state.telegramChatId,
-        active.state.telegramMessageId,
-        progressBar,
-      );
+      const activeRuns = state.findAllActiveRuns(runsDir);
+      for (const active of activeRuns) {
+        if (!active.state.telegramMessageId || !active.state.telegramChatId) continue;
+        const progressBar = buildTimerProgressBar(active);
+        await editProgressBar(
+          active.state.telegramChatId,
+          active.state.telegramMessageId,
+          progressBar,
+        );
+      }
       lastTimerUpdateMs = Date.now();
     });
 
@@ -631,28 +641,32 @@ export default {
     // This ensures the ⏱ display stays current during long-running operations.
     const timerInterval = setInterval(async () => {
       try {
-        const active = state.findActiveRun(runsDir);
-        if (!active) return;
-        if (!active.state.telegramMessageId || !active.state.telegramChatId) return;
-
         // Don't duplicate if a tool-based update happened recently
         const now = Date.now();
         if (now - lastTimerUpdateMs < TIMER_UPDATE_INTERVAL_MS) return;
 
-        const progressBar = buildTimerProgressBar(active);
+        // Update ALL active runs' progress bars
+        const activeRuns = state.findAllActiveRuns(runsDir);
+        if (activeRuns.length === 0) return;
 
-        const ok = await editProgressBar(
-          active.state.telegramChatId,
-          active.state.telegramMessageId,
-          progressBar,
-        );
-        if (!ok) {
-          active.state.telegramMessageId = undefined;
-          state.writeRunState(runsDir, active.runId, active.state);
+        for (const active of activeRuns) {
+          if (!active.state.telegramMessageId || !active.state.telegramChatId) continue;
+
+          const progressBar = buildTimerProgressBar(active);
+
+          const ok = await editProgressBar(
+            active.state.telegramChatId,
+            active.state.telegramMessageId,
+            progressBar,
+          );
+          if (!ok) {
+            active.state.telegramMessageId = undefined;
+            state.writeRunState(runsDir, active.runId, active.state);
+          }
         }
 
         lastTimerUpdateMs = now;
-        api.logger.debug(`[harness-enforcer] Timer tick (interval)`);
+        api.logger.debug(`[harness-enforcer] Timer tick (interval, ${activeRuns.length} active runs)`);
       } catch (err) {
         api.logger.debug(
           `[harness-enforcer] Timer tick error: ${err instanceof Error ? err.message : String(err)}`,
@@ -672,7 +686,7 @@ export default {
 
     // ─── HOOK 3: session_start — crash recovery & context bootstrap ───
     api.on("session_start", async (_event, ctx) => {
-      const active = state.findActiveRun(runsDir);
+      const active = state.findActiveRunForSession(runsDir, ctx.sessionKey);
       if (!active) return;
 
       const progressContent = state.readProgressFile(runsDir, active.runId);

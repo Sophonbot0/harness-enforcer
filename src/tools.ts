@@ -4,6 +4,11 @@ import * as state from "./state.js";
 import * as validation from "./validation.js";
 import { renderProgressBar, renderFinalStatus } from "./progress.js";
 
+/** Shared mutable ref so tools can read the current session key set by the hook. */
+export interface SessionContext {
+  currentSessionKey: string | undefined;
+}
+
 function jsonResult(payload: unknown): {
   content: Array<{ type: "text"; text: string }>;
   details: unknown;
@@ -26,7 +31,7 @@ function formatDuration(seconds: number): string {
 
 // ─── harness_start ───
 
-export function createHarnessStartTool(runsDir: string): AnyAgentTool {
+export function createHarnessStartTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
   return {
     name: "harness_start",
     label: "Harness Start",
@@ -73,11 +78,12 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
         );
         const taskDescription = validation.readStringParam(p, "taskDescription");
 
-        // Check for already-active run
-        const active = state.findActiveRun(runsDir);
+        // Check for already-active run ON THIS SESSION (allows concurrent runs on different sessions)
+        const sessionKey = sessionCtx.currentSessionKey;
+        const active = state.findActiveRunForSession(runsDir, sessionKey);
         if (active) {
           return jsonResult({
-            error: "A harness run is already active.",
+            error: "A harness run is already active for this session.",
             activeRunId: active.runId,
             phase: active.state.phase,
             startedAt: active.state.startedAt,
@@ -113,6 +119,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           round: 1,
           checkpoints: [],
           status: "active",
+          ...(sessionKey ? { sessionKey } : {}),
           ...(telegramChatId ? { telegramChatId } : {}),
           ...(telegramThreadId ? { telegramThreadId } : {}),
           ...(verifyCommand ? { verifyCommand } : {}),
@@ -174,7 +181,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
 
 // ─── harness_checkpoint ───
 
-export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
+export function createHarnessCheckpointTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
   return {
     name: "harness_checkpoint",
     label: "Harness Checkpoint",
@@ -246,7 +253,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
         const currentAction = validation.readOptionalStringParam(p, "currentAction");
         const contextSnapshot = p.contextSnapshot as state.ContextSnapshot | undefined;
 
-        const active = state.findActiveRun(runsDir);
+        const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
         if (!active) {
           return jsonResult({
             error: "No active harness run found.",
@@ -376,7 +383,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
 
 // ─── harness_submit ───
 
-export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
+export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
   return {
     name: "harness_submit",
     label: "Harness Submit",
@@ -415,7 +422,7 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
           : undefined;
         const rawNextPlan = validation.readOptionalStringParam(p, "nextPlanPath");
 
-        const active = state.findActiveRun(runsDir);
+        const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
         if (!active) {
           return jsonResult({
             error: "No active harness run found.",
@@ -593,7 +600,7 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
 
 // ─── harness_status ───
 
-export function createHarnessResetTool(runsDir: string): AnyAgentTool {
+export function createHarnessResetTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
   return {
     name: "harness_reset",
     label: "Harness Reset",
@@ -616,7 +623,7 @@ export function createHarnessResetTool(runsDir: string): AnyAgentTool {
         const p = params as Record<string, unknown>;
         const reason = validation.readOptionalStringParam(p, "reason") ?? "Manual reset";
 
-        const active = state.findActiveRun(runsDir);
+        const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
         if (!active) {
           return jsonResult({
             message: "No active harness run to reset.",
@@ -682,7 +689,7 @@ export function createHarnessResetTool(runsDir: string): AnyAgentTool {
 
 // ─── harness_resume ───
 
-export function createHarnessResumeTool(runsDir: string): AnyAgentTool {
+export function createHarnessResumeTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
   return {
     name: "harness_resume",
     label: "Harness Resume",
@@ -706,7 +713,7 @@ export function createHarnessResumeTool(runsDir: string): AnyAgentTool {
         const requestedRunId = validation.readOptionalStringParam(p, "runId");
 
         // Check no active run exists
-        const active = state.findActiveRun(runsDir);
+        const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
         if (active) {
           return jsonResult({
             error: "Cannot resume — an active run already exists.",
@@ -770,6 +777,7 @@ export function createHarnessResumeTool(runsDir: string): AnyAgentTool {
           checkpoints: [],
           status: "active",
           resumedFrom: sourceRun.runId,
+          ...(sessionCtx.currentSessionKey ? { sessionKey: sessionCtx.currentSessionKey } : {}),
           ...(sourceRun.state.telegramChatId ? { telegramChatId: sourceRun.state.telegramChatId } : {}),
           ...(sourceRun.state.telegramThreadId ? { telegramThreadId: sourceRun.state.telegramThreadId } : {}),
           ...(sourceRun.state.verifyCommand ? { verifyCommand: sourceRun.state.verifyCommand } : {}),
@@ -898,7 +906,7 @@ export function createHarnessResumeTool(runsDir: string): AnyAgentTool {
 
 // ─── harness_status ───
 
-export function createHarnessStatusTool(runsDir: string): AnyAgentTool {
+export function createHarnessStatusTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
   return {
     name: "harness_status",
     label: "Harness Status",
@@ -947,7 +955,7 @@ export function createHarnessStatusTool(runsDir: string): AnyAgentTool {
           const s = state.readRunState(runsDir, requestedRunId);
           if (s) target = { runId: requestedRunId, state: s };
         } else {
-          target = state.findActiveRun(runsDir) ?? state.findMostRecentRun(runsDir);
+          target = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey) ?? state.findMostRecentRun(runsDir);
         }
 
         if (!target) {
