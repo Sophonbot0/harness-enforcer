@@ -510,33 +510,54 @@ export default {
         }
         if (!chatId) return;
 
-        const active = state.findActiveRun(runsDir);
-        if (!active) return;
+        // For harness_submit / harness_reset, the run may already be completed/cancelled
+        // so findActiveRun won't find it. Use payload fields + fallback to active run.
+        const messageId = payload.telegramMessageId as string | undefined;
+        const runId = payload.runId as string | undefined;
 
-        if (!active.state.telegramChatId) {
-          active.state.telegramChatId = chatId;
-          if (threadId) active.state.telegramThreadId = threadId;
-          state.writeRunState(runsDir, active.runId, active.state);
+        // Try active run first, then fall back to reading the specific run from payload
+        let runState: state.RunState | null = null;
+        let resolvedRunId: string | undefined;
+        const active = state.findActiveRun(runsDir);
+        if (active) {
+          runState = active.state;
+          resolvedRunId = active.runId;
+        } else if (runId) {
+          // Run already completed/cancelled — read its state directly
+          runState = state.readRunState(runsDir, runId);
+          resolvedRunId = runId;
         }
 
-        if (!active.state.telegramMessageId) {
-          await sendProgressBar(
-            chatId,
-            threadId,
-            progressBar,
-            active.state,
-            active.runId,
-          );
+        if (runState && resolvedRunId && !runState.telegramChatId) {
+          runState.telegramChatId = chatId;
+          if (threadId) runState.telegramThreadId = threadId;
+          state.writeRunState(runsDir, resolvedRunId, runState);
+        }
+
+        // Resolve which messageId to use: payload > runState > none
+        const resolvedMsgId = messageId ?? runState?.telegramMessageId;
+
+        if (!resolvedMsgId) {
+          // No existing message — send a new one
+          if (runState && resolvedRunId) {
+            await sendProgressBar(
+              chatId,
+              threadId,
+              progressBar,
+              runState,
+              resolvedRunId,
+            );
+          }
         } else {
           const ok = await editProgressBar(
             chatId,
-            active.state.telegramMessageId,
+            resolvedMsgId,
             progressBar,
           );
-          if (!ok) {
+          if (!ok && runState && resolvedRunId) {
             // Message was deleted — clear the ID so next call sends a new one
-            active.state.telegramMessageId = undefined;
-            state.writeRunState(runsDir, active.runId, active.state);
+            runState.telegramMessageId = undefined;
+            state.writeRunState(runsDir, resolvedRunId, runState);
           }
         }
 
