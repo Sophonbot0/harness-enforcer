@@ -1,4 +1,5 @@
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
+import * as fs from "node:fs";
 import * as state from "./state.js";
 import * as validation from "./validation.js";
 import { renderProgressBar, renderFinalStatus } from "./progress.js";
@@ -56,6 +57,10 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Optional command to verify work (e.g. 'npm test', 'vitest run'). Stored in run state and recommended to agent before marking features done.",
         },
+        parentRunId: {
+          type: "string",
+          description: "Optional parent run ID to link sub-plans for orchestration. Enables future multi-plan hierarchies.",
+        },
       },
       required: ["planPath", "taskDescription"],
     },
@@ -97,6 +102,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
         const telegramChatId = validation.readOptionalStringParam(p, "telegramChatId");
         const telegramThreadId = validation.readOptionalStringParam(p, "telegramThreadId");
         const verifyCommand = validation.readOptionalStringParam(p, "verifyCommand");
+        const parentRunId = validation.readOptionalStringParam(p, "parentRunId");
 
         const runState: state.RunState = {
           runId,
@@ -110,6 +116,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           ...(telegramChatId ? { telegramChatId } : {}),
           ...(telegramThreadId ? { telegramThreadId } : {}),
           ...(verifyCommand ? { verifyCommand } : {}),
+          ...(parentRunId ? { parentRunId } : {}),
         };
 
         state.writeRunState(runsDir, runId, runState);
@@ -212,6 +219,17 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "What the agent is currently doing. Shown in the progress bar work log instead of sending separate messages.",
         },
+        contextSnapshot: {
+          type: "object",
+          description: "Cross-session context preservation. Survives crashes and context compaction. Include key decisions, files modified, current approach, and next steps.",
+          properties: {
+            keyDecisions: { type: "array", items: { type: "string" }, description: "Important decisions made during this run." },
+            filesModified: { type: "array", items: { type: "string" }, description: "Files touched so far." },
+            currentApproach: { type: "string", description: "What strategy is being used." },
+            blockerHistory: { type: "array", items: { type: "string" }, description: "Blockers that were resolved." },
+            nextSteps: { type: "array", items: { type: "string" }, description: "What should happen next (for resume)." },
+          },
+        },
       },
       required: ["phase", "completedFeatures", "pendingFeatures", "blockers", "summary"],
     },
@@ -226,6 +244,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
         const telegramMessageId = validation.readOptionalStringParam(p, "telegramMessageId");
         const verificationLog = validation.readOptionalStringParam(p, "verificationLog");
         const currentAction = validation.readOptionalStringParam(p, "currentAction");
+        const contextSnapshot = p.contextSnapshot as state.ContextSnapshot | undefined;
 
         const active = state.findActiveRun(runsDir);
         if (!active) {
@@ -260,8 +279,15 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             blockers,
             summary,
             ...(verificationLog ? { verificationLog: verificationLog.slice(0, 5000) } : {}),
+            ...(contextSnapshot ? { contextSnapshot } : {}),
           };
           state.appendCheckpoint(runsDir, runId, checkpoint);
+
+          // Persist latest context snapshot to run state for recovery
+          if (contextSnapshot) {
+            runState.lastContextSnapshot = contextSnapshot;
+            state.writeRunState(runsDir, runId, runState);
+          }
 
           // Sync features from checkpoint (Anthropic pattern)
           state.syncFeaturesFromCheckpoint(
@@ -545,7 +571,11 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
           // Run chaining — auto-continue to next plan
           if (rawNextPlan) {
             res.nextPlanPath = rawNextPlan;
-            res.chainingInstruction = `Run delivered successfully. To continue, call harness_start with planPath="${rawNextPlan}" to start the next run.`;
+            res.autoChain = true;
+            res.chainingInstruction =
+              `🔗 AUTO-CHAIN: This run is complete. Immediately call harness_start with planPath="${rawNextPlan}" ` +
+              `to start the next run. Do NOT wait for user input. Carry forward the telegramChatId and telegramThreadId. ` +
+              `Use parentRunId="${runId}" to link the runs.`;
           }
 
           return res;
@@ -644,6 +674,222 @@ export function createHarnessResetTool(runsDir: string): AnyAgentTool {
       } catch (err) {
         return jsonResult({
           error: `harness_reset failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    },
+  };
+}
+
+// ─── harness_resume ───
+
+export function createHarnessResumeTool(runsDir: string): AnyAgentTool {
+  return {
+    name: "harness_resume",
+    label: "Harness Resume",
+    description:
+      "Resume a cancelled, stale, or failed harness run. Creates a new active run that carries over " +
+      "the context snapshot, completed features, plan path, and Telegram IDs from the original run. " +
+      "Use this to recover from crashes, context loss, or gateway restarts.",
+    parameters: {
+      type: "object",
+      properties: {
+        runId: {
+          type: "string",
+          description: "Run ID to resume. If omitted, resumes the most recent non-active run.",
+        },
+      },
+      required: [],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const p = params as Record<string, unknown>;
+        const requestedRunId = validation.readOptionalStringParam(p, "runId");
+
+        // Check no active run exists
+        const active = state.findActiveRun(runsDir);
+        if (active) {
+          return jsonResult({
+            error: "Cannot resume — an active run already exists.",
+            activeRunId: active.runId,
+            hint: "Complete, submit, or reset the current run first.",
+          });
+        }
+
+        // Find the run to resume
+        let sourceRun: { runId: string; state: state.RunState } | null = null;
+        if (requestedRunId) {
+          const s = state.readRunState(runsDir, requestedRunId);
+          if (s) sourceRun = { runId: requestedRunId, state: s };
+        } else {
+          sourceRun = state.findMostRecentRun(runsDir);
+        }
+
+        if (!sourceRun) {
+          return jsonResult({
+            error: "No run found to resume.",
+            hint: requestedRunId
+              ? `Run '${requestedRunId}' does not exist.`
+              : "No previous runs found.",
+          });
+        }
+
+        if (sourceRun.state.status === "active") {
+          return jsonResult({
+            error: "That run is still active — nothing to resume.",
+            runId: sourceRun.runId,
+          });
+        }
+
+        if (sourceRun.state.status === "completed") {
+          return jsonResult({
+            error: "That run completed successfully — use harness_start with nextPlanPath instead.",
+            runId: sourceRun.runId,
+          });
+        }
+
+        // Load context from the source run
+        const sourceCheckpoints = state.readCheckpoints(runsDir, sourceRun.runId);
+        const lastCheckpoint = sourceCheckpoints.length > 0
+          ? sourceCheckpoints[sourceCheckpoints.length - 1]
+          : null;
+        const sourceFeatures = state.readFeatures(runsDir, sourceRun.runId);
+        const sourceDod = state.readDodItems(runsDir, sourceRun.runId);
+        const contextSnapshot = sourceRun.state.lastContextSnapshot ?? lastCheckpoint?.contextSnapshot;
+
+        // Create new run carrying over state
+        const newRunId = state.generateRunId();
+        const now = new Date().toISOString();
+
+        const newRunState: state.RunState = {
+          runId: newRunId,
+          planPath: sourceRun.state.planPath,
+          taskDescription: sourceRun.state.taskDescription,
+          startedAt: now,
+          phase: lastCheckpoint?.phase ?? sourceRun.state.phase,
+          round: sourceRun.state.round + 1,
+          checkpoints: [],
+          status: "active",
+          resumedFrom: sourceRun.runId,
+          ...(sourceRun.state.telegramChatId ? { telegramChatId: sourceRun.state.telegramChatId } : {}),
+          ...(sourceRun.state.telegramThreadId ? { telegramThreadId: sourceRun.state.telegramThreadId } : {}),
+          ...(sourceRun.state.verifyCommand ? { verifyCommand: sourceRun.state.verifyCommand } : {}),
+          ...(sourceRun.state.parentRunId ? { parentRunId: sourceRun.state.parentRunId } : {}),
+          ...(contextSnapshot ? { lastContextSnapshot: contextSnapshot } : {}),
+        };
+
+        state.writeRunState(runsDir, newRunId, newRunState);
+
+        // Carry over DoD items and features
+        if (sourceDod.length > 0) {
+          state.writeDodItems(runsDir, newRunId, sourceDod);
+        }
+        if (sourceFeatures.length > 0) {
+          state.writeFeatures(runsDir, newRunId, sourceFeatures);
+        }
+
+        // Build resume briefing for the agent
+        const completedFeatures = lastCheckpoint?.completedFeatures ?? [];
+        const pendingFeatures = lastCheckpoint?.pendingFeatures ?? [];
+        const blockers = lastCheckpoint?.blockers ?? [];
+
+        const briefing: string[] = [
+          `# Resume Briefing`,
+          ``,
+          `**Original Run:** ${sourceRun.runId}`,
+          `**Status:** ${sourceRun.state.status}`,
+          `**Task:** ${sourceRun.state.taskDescription}`,
+          `**Phase when stopped:** ${lastCheckpoint?.phase ?? sourceRun.state.phase}`,
+          `**Round:** ${newRunState.round}`,
+          ``,
+          `## Completed (${completedFeatures.length})`,
+          ...completedFeatures.map(f => `- ✅ ${f}`),
+          ``,
+          `## Pending (${pendingFeatures.length})`,
+          ...pendingFeatures.map(f => `- ⬜ ${f}`),
+          ``,
+        ];
+
+        if (blockers.length > 0) {
+          briefing.push(`## Blockers from previous run`);
+          briefing.push(...blockers.map(b => `- 🚫 ${b}`));
+          briefing.push(``);
+        }
+
+        if (contextSnapshot) {
+          briefing.push(`## Context Snapshot`);
+          if (contextSnapshot.currentApproach) {
+            briefing.push(`**Approach:** ${contextSnapshot.currentApproach}`);
+          }
+          if (contextSnapshot.keyDecisions && contextSnapshot.keyDecisions.length > 0) {
+            briefing.push(`**Key Decisions:**`);
+            briefing.push(...contextSnapshot.keyDecisions.map(d => `- ${d}`));
+          }
+          if (contextSnapshot.filesModified && contextSnapshot.filesModified.length > 0) {
+            briefing.push(`**Files Modified:**`);
+            briefing.push(...contextSnapshot.filesModified.map(f => `- \`${f}\``));
+          }
+          if (contextSnapshot.nextSteps && contextSnapshot.nextSteps.length > 0) {
+            briefing.push(`**Next Steps:**`);
+            briefing.push(...contextSnapshot.nextSteps.map(s => `- ${s}`));
+          }
+          briefing.push(``);
+        }
+
+        if (lastCheckpoint?.summary) {
+          briefing.push(`## Last Summary`);
+          briefing.push(lastCheckpoint.summary);
+          briefing.push(``);
+        }
+
+        // Write briefing to disk for cross-session access
+        const runDir = state.getRunDir(runsDir, newRunId);
+        state.ensureDir(runDir);
+        const briefingText = briefing.join("\n");
+        const briefingPath = `${runDir}/resume-briefing.md`;
+        fs.writeFileSync(briefingPath, briefingText);
+
+        // Render progress bar
+        const progressBar = renderProgressBar({
+          taskDescription: newRunState.taskDescription,
+          phase: newRunState.phase,
+          completedFeatures,
+          pendingFeatures,
+          blockers,
+          dodTotal: sourceDod.length,
+          dodCompleted: completedFeatures.length,
+          elapsedSeconds: 0,
+        });
+
+        const result: Record<string, unknown> = {
+          success: true,
+          resumed: true,
+          newRunId,
+          resumedFrom: sourceRun.runId,
+          originalStatus: sourceRun.state.status,
+          round: newRunState.round,
+          phase: newRunState.phase,
+          completedCount: completedFeatures.length,
+          pendingCount: pendingFeatures.length,
+          blockerCount: blockers.length,
+          hasContextSnapshot: !!contextSnapshot,
+          briefingPath,
+          progressBar,
+          briefing: briefingText,
+        };
+
+        if (newRunState.telegramChatId) {
+          result.telegramAutoManaged = true;
+          result.telegramChatId = newRunState.telegramChatId;
+          if (newRunState.telegramThreadId) result.telegramThreadId = newRunState.telegramThreadId;
+        }
+
+        result.instruction = "Read the resume briefing above carefully. Continue from where the previous run stopped. " +
+          "Call harness_checkpoint to record your progress. Do NOT restart completed features.";
+
+        return jsonResult(result);
+      } catch (err) {
+        return jsonResult({
+          error: `harness_resume failed: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
     },

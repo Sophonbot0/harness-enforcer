@@ -7,6 +7,7 @@ import {
   createHarnessSubmitTool,
   createHarnessStatusTool,
   createHarnessResetTool,
+  createHarnessResumeTool,
 } from "./src/tools.js";
 import * as state from "./src/state.js";
 import { renderProgressBar, renderFinalStatus } from "./src/progress.js";
@@ -24,6 +25,7 @@ const HARNESS_TOOLS = new Set([
   "harness_checkpoint",
   "harness_submit",
   "harness_reset",
+  "harness_resume",
 ]);
 
 // ─── Configuration ───
@@ -91,6 +93,7 @@ export default {
     api.registerTool(() => createHarnessSubmitTool(runsDir));
     api.registerTool(() => createHarnessStatusTool(runsDir));
     api.registerTool(() => createHarnessResetTool(runsDir));
+    api.registerTool(() => createHarnessResumeTool(runsDir));
 
     // ─── Helpers ───
 
@@ -667,13 +670,17 @@ export default {
       `[harness-enforcer] Plugin loaded. Stale timeout: ${STALE_RUN_TIMEOUT_MS / 60000}min, Timer interval: ${TIMER_UPDATE_INTERVAL_MS / 1000}s`,
     );
 
-    // ─── HOOK 3: session_start — bootstrap context for new sessions ───
+    // ─── HOOK 3: session_start — crash recovery & context bootstrap ───
     api.on("session_start", async (_event, ctx) => {
       const active = state.findActiveRun(runsDir);
       if (!active) return;
 
       const progressContent = state.readProgressFile(runsDir, active.runId);
       const features = state.readFeatures(runsDir, active.runId);
+      const checkpoints = state.readCheckpoints(runsDir, active.runId);
+      const lastCheckpoint = checkpoints.length > 0
+        ? checkpoints[checkpoints.length - 1]
+        : null;
 
       if (!progressContent && features.length === 0) return;
 
@@ -681,20 +688,68 @@ export default {
         ? `Features: ${features.filter(f => f.status === "passed").length}/${features.length} passed`
         : "";
 
-      const bootstrapMsg = [
-        `📋 **Active Harness Run Detected**`,
+      // Build comprehensive recovery context
+      const bootstrapParts: string[] = [
+        `📋 **Active Harness Run Detected — Auto-Recovery**`,
         `Task: ${active.state.taskDescription}`,
         `Phase: ${active.state.phase}`,
         `Run ID: ${active.runId}`,
+        `Round: ${active.state.round}`,
         featureSummary,
         ``,
-        `Read the progress file and features.json before proceeding:`,
+      ];
+
+      // Include completed/pending features for immediate awareness
+      if (lastCheckpoint) {
+        if (lastCheckpoint.completedFeatures.length > 0) {
+          bootstrapParts.push(`**Completed:** ${lastCheckpoint.completedFeatures.join(", ")}`);
+        }
+        if (lastCheckpoint.pendingFeatures.length > 0) {
+          bootstrapParts.push(`**Pending:** ${lastCheckpoint.pendingFeatures.join(", ")}`);
+        }
+        if (lastCheckpoint.blockers.length > 0) {
+          bootstrapParts.push(`**Blockers:** ${lastCheckpoint.blockers.join(", ")}`);
+        }
+        bootstrapParts.push(`**Last summary:** ${lastCheckpoint.summary}`);
+        bootstrapParts.push(``);
+      }
+
+      // Include context snapshot if available
+      const contextSnapshot = active.state.lastContextSnapshot ?? lastCheckpoint?.contextSnapshot;
+      if (contextSnapshot) {
+        bootstrapParts.push(`**── Context Snapshot ──**`);
+        if (contextSnapshot.currentApproach) {
+          bootstrapParts.push(`Approach: ${contextSnapshot.currentApproach}`);
+        }
+        if (contextSnapshot.keyDecisions && contextSnapshot.keyDecisions.length > 0) {
+          bootstrapParts.push(`Key decisions: ${contextSnapshot.keyDecisions.join("; ")}`);
+        }
+        if (contextSnapshot.filesModified && contextSnapshot.filesModified.length > 0) {
+          bootstrapParts.push(`Files modified: ${contextSnapshot.filesModified.join(", ")}`);
+        }
+        if (contextSnapshot.nextSteps && contextSnapshot.nextSteps.length > 0) {
+          bootstrapParts.push(`Next steps: ${contextSnapshot.nextSteps.join("; ")}`);
+        }
+        bootstrapParts.push(``);
+      }
+
+      bootstrapParts.push(
+        `**Instructions:** Continue the active harness run from where it left off.`,
+        `Do NOT restart completed features. Call harness_checkpoint to record progress.`,
+        ``,
+        `Files on disk:`,
         `- Progress: ~/.openclaw/harness-enforcer/runs/${active.runId}/progress.md`,
         `- Features: ~/.openclaw/harness-enforcer/runs/${active.runId}/features.json`,
         active.state.verifyCommand ? `- Verify command: ${active.state.verifyCommand}` : "",
-      ].filter(Boolean).join("\n");
+      );
 
-      api.logger.info(`[harness-enforcer] Session bootstrap: injecting run context for ${active.runId}`);
+      if (active.state.resumedFrom) {
+        bootstrapParts.push(`- Resume briefing: ~/.openclaw/harness-enforcer/runs/${active.runId}/resume-briefing.md`);
+      }
+
+      const bootstrapMsg = bootstrapParts.filter(Boolean).join("\n");
+
+      api.logger.info(`[harness-enforcer] Session bootstrap: injecting recovery context for ${active.runId} (checkpoint #${checkpoints.length})`);
 
       // Inject context as a system note (if the API supports it)
       try {

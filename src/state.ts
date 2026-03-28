@@ -16,6 +16,9 @@ export interface RunState {
   telegramMessageId?: string;
   verifyCommand?: string;
   workLog?: string[];  // Last N action entries for progress bar
+  parentRunId?: string;  // Links sub-plans to a parent run for orchestration
+  resumedFrom?: string;  // If this run was resumed from a cancelled/stale run
+  lastContextSnapshot?: ContextSnapshot;  // Latest context snapshot for recovery
 }
 
 export interface Checkpoint {
@@ -26,6 +29,16 @@ export interface Checkpoint {
   blockers: string[];
   summary: string;
   verificationLog?: string;
+  contextSnapshot?: ContextSnapshot;
+}
+
+/** Cross-session context preservation — survives crashes and compaction */
+export interface ContextSnapshot {
+  keyDecisions?: string[];       // Important decisions made during this run
+  filesModified?: string[];      // Files touched so far
+  currentApproach?: string;      // What strategy is being used
+  blockerHistory?: string[];     // Blockers that were resolved (for learning)
+  nextSteps?: string[];          // What should happen next (for resume)
 }
 
 export interface Delivery {
@@ -259,6 +272,28 @@ export function writeProgressFile(
   lines.push(`## Summary`);
   lines.push(checkpoint.summary);
   lines.push(``);
+
+  // Context snapshot for cross-session recovery
+  if (checkpoint.contextSnapshot) {
+    const cs = checkpoint.contextSnapshot;
+    lines.push(`## Context Snapshot`);
+    if (cs.currentApproach) {
+      lines.push(`**Approach:** ${cs.currentApproach}`);
+    }
+    if (cs.keyDecisions && cs.keyDecisions.length > 0) {
+      lines.push(`**Key Decisions:**`);
+      lines.push(...cs.keyDecisions.map(d => `- ${d}`));
+    }
+    if (cs.filesModified && cs.filesModified.length > 0) {
+      lines.push(`**Files Modified:**`);
+      lines.push(...cs.filesModified.map(f => `- \`${f}\``));
+    }
+    if (cs.nextSteps && cs.nextSteps.length > 0) {
+      lines.push(`**Next Steps:**`);
+      lines.push(...cs.nextSteps.map(s => `- ${s}`));
+    }
+    lines.push(``);
+  }
 
   safeWriteFile(path.join(dir, "progress.md"), lines.join("\n"));
 }
