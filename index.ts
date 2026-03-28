@@ -94,6 +94,29 @@ export default {
 
     // ─── Helpers ───
 
+    async function deleteProgressBar(
+      chatId: string,
+      messageId: string,
+    ): Promise<boolean> {
+      try {
+        // Try the conversation actions API first
+        if (api.runtime?.channel?.telegram?.conversationActions?.deleteMessage) {
+          await api.runtime.channel.telegram.conversationActions.deleteMessage(
+            chatId,
+            messageId,
+          );
+          return true;
+        }
+        // Fallback: try sendMessageTelegram-style delete if available
+        api.logger.warn(`[harness-enforcer] deleteMessage API not available, message ${messageId} will remain`);
+        return false;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        api.logger.warn(`[harness-enforcer] Telegram delete failed: ${msg}`);
+        return false;
+      }
+    }
+
     async function editProgressBar(
       chatId: string,
       messageId: string,
@@ -433,6 +456,43 @@ export default {
           return;
         }
 
+        // ── harness_reset: delete the Telegram message instead of editing ──
+        if (event.toolName === "harness_reset" && payload?.telegramDeleteOnReset) {
+          // The run is already cancelled — find the message info from the payload
+          const msgId = payload.telegramMessageId as string | undefined;
+          const cId = payload.telegramChatId as string | undefined;
+          // Try to get from the payload directly, or fall back to parsing
+          let deleteChatId = cId;
+          let deleteMsgId = msgId;
+          
+          if (!deleteChatId || !deleteMsgId) {
+            // The run state was already updated — try to read from the payload's run info
+            // The progressBar is in the payload, meaning the reset recorded the info
+            // We need to get it from the cancelled run state which still has the IDs
+            const cancelledRunId = payload.runId as string | undefined;
+            if (cancelledRunId) {
+              const cancelledState = state.readRunState(runsDir, cancelledRunId);
+              if (cancelledState) {
+                deleteChatId = deleteChatId ?? cancelledState.telegramChatId;
+                deleteMsgId = deleteMsgId ?? cancelledState.telegramMessageId;
+              }
+            }
+          }
+          
+          if (!deleteChatId) {
+            const parsed = parseTelegramFromSessionKey(ctx.sessionKey);
+            if (parsed) deleteChatId = parsed.chatId;
+          }
+          
+          if (deleteChatId && deleteMsgId) {
+            await deleteProgressBar(deleteChatId, deleteMsgId);
+            api.logger.info(`[harness-enforcer] Deleted progress bar message ${deleteMsgId} on reset`);
+          }
+          
+          lastTimerUpdateMs = Date.now();
+          return;
+        }
+
         if (!payload?.progressBar || typeof payload.progressBar !== "string")
           return;
 
@@ -541,6 +601,45 @@ export default {
       );
       lastTimerUpdateMs = Date.now();
     });
+
+    // ─── TIMER: setInterval fallback for elapsed time updates ───
+    // Updates the progress bar timer every 30s even when no tool calls happen.
+    // This ensures the ⏱ display stays current during long-running operations.
+    const timerInterval = setInterval(async () => {
+      try {
+        const active = state.findActiveRun(runsDir);
+        if (!active) return;
+        if (!active.state.telegramMessageId || !active.state.telegramChatId) return;
+
+        // Don't duplicate if a tool-based update happened recently
+        const now = Date.now();
+        if (now - lastTimerUpdateMs < TIMER_UPDATE_INTERVAL_MS) return;
+
+        const progressBar = buildTimerProgressBar(active);
+
+        const ok = await editProgressBar(
+          active.state.telegramChatId,
+          active.state.telegramMessageId,
+          progressBar,
+        );
+        if (!ok) {
+          active.state.telegramMessageId = undefined;
+          state.writeRunState(runsDir, active.runId, active.state);
+        }
+
+        lastTimerUpdateMs = now;
+        api.logger.debug(`[harness-enforcer] Timer tick (interval)`);
+      } catch (err) {
+        api.logger.debug(
+          `[harness-enforcer] Timer tick error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }, TIMER_UPDATE_INTERVAL_MS);
+
+    // Prevent the interval from keeping the process alive
+    if (typeof timerInterval === "object" && timerInterval && "unref" in timerInterval) {
+      (timerInterval as NodeJS.Timeout).unref();
+    }
 
     // Log startup
     api.logger.info(

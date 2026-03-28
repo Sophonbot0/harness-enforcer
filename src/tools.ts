@@ -149,11 +149,8 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
         };
 
         if (telegramChatId) {
-          result.telegramAction = "send";
-          result.telegramChatId = telegramChatId;
-          if (telegramThreadId) result.telegramThreadId = telegramThreadId;
-          result.telegramInstructions = "Send progressBar as a Telegram message using 'message action=send'. Save the returned messageId and pass it to harness_checkpoint as telegramMessageId.";
-          result.silentWorkMode = "⚠️ IMPORTANT: Do NOT send separate progress messages during the harness run. Use harness_checkpoint with currentAction to update the progress bar instead. All work status goes through the progress bar edit, not new messages.";
+          result.telegramAutoManaged = true;
+          result.silentWorkMode = "⚠️ IMPORTANT: The plugin auto-sends and auto-edits the Telegram progress bar. Do NOT send or edit any Telegram messages yourself during this harness run. Just call harness_checkpoint to update progress — the bar updates automatically.";
         }
 
         return jsonResult(result);
@@ -328,14 +325,9 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             res.featureStatus = { passed, pending: pending2, total: features.length };
           }
 
-          // Include Telegram edit instructions if we have the info
-          const msgId = resolvedMessageId;
-          if (msgId && runState.telegramChatId) {
-            res.telegramAction = "edit";
-            res.telegramMessageId = msgId;
-            res.telegramChatId = runState.telegramChatId;
-            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
-            res.telegramInstructions = "Edit the Telegram message using: message action=edit messageId=<telegramMessageId> target=<telegramChatId> message=<progressBar>";
+          // Telegram is auto-managed by the plugin hook — no agent action needed
+          if (runState.telegramChatId) {
+            res.telegramAutoManaged = true;
           }
 
           return res;
@@ -533,13 +525,9 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
             ...(warnings.length > 0 ? { warnings } : {}),
           };
 
-          // Include Telegram edit instructions
-          if (runState.telegramMessageId && runState.telegramChatId) {
-            res.telegramAction = "edit";
-            res.telegramMessageId = runState.telegramMessageId;
-            res.telegramChatId = runState.telegramChatId;
-            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
-            res.telegramInstructions = "Edit the Telegram message with the final DELIVERED status using: message action=edit";
+          // Telegram is auto-managed by the plugin hook — no agent action needed
+          if (runState.telegramChatId) {
+            res.telegramAutoManaged = true;
           }
 
           // Run chaining — auto-continue to next plan
@@ -629,13 +617,12 @@ export function createHarnessResetTool(runsDir: string): AnyAgentTool {
             progressBar,
           };
 
-          // Include Telegram edit instructions
+          // Telegram message will be auto-deleted by the plugin hook
           if (runState.telegramMessageId && runState.telegramChatId) {
-            res.telegramAction = "edit";
+            res.telegramAutoManaged = true;
+            res.telegramDeleteOnReset = true;
             res.telegramMessageId = runState.telegramMessageId;
             res.telegramChatId = runState.telegramChatId;
-            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
-            res.telegramInstructions = "Edit the Telegram message with the final cancelled status using: message action=edit";
           }
 
           return res;

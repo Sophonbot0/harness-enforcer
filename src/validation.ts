@@ -51,15 +51,20 @@ export function readStringArrayParam(params: Record<string, unknown>, key: strin
   return val as string[];
 }
 
-/** Validate and sanitize a file path. Rejects traversal and paths outside ~/.openclaw. */
+/** Validate and sanitize a file path. Rejects traversal and paths outside allowed directories. */
 export function sanitizePath(filePath: string, paramName: string): string {
   const resolved = path.resolve(filePath);
   if (filePath.includes("..")) {
     throw new Error(`Parameter '${paramName}' must not contain '..' path traversal`);
   }
-  const allowedPrefix = path.join(os.homedir(), ".openclaw");
-  if (!resolved.startsWith(allowedPrefix)) {
-    throw new Error(`Parameter '${paramName}' must be under ~/.openclaw (got: ${resolved})`);
+  const home = os.homedir();
+  const allowedPrefixes = [
+    path.join(home, ".openclaw"),
+    path.join(home, "Projects"),
+  ];
+  const isAllowed = allowedPrefixes.some(prefix => resolved.startsWith(prefix));
+  if (!isAllowed) {
+    throw new Error(`Parameter '${paramName}' must be under ~/.openclaw or ~/Projects (got: ${resolved})`);
   }
   return resolved;
 }
