@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import type { Feature } from "./state.js";
 
 export interface DodItem {
   text: string;
@@ -148,4 +149,60 @@ export function findUnaddressedCriticals(content: string): string[] {
 export function findUncheckedDod(planContent: string): string[] {
   const items = extractDodItems(planContent);
   return items.filter((i) => !i.checked).map((i) => i.text);
+}
+
+/**
+ * Extract structured features from a markdown plan.
+ * Looks for checkbox items under ### headings, grouping by heading as category.
+ * Each `- [ ] **Bold text**: description` or `- [ ] text` becomes a Feature.
+ */
+export function extractFeatures(content: string): Feature[] {
+  const lines = content.split("\n");
+  const features: Feature[] = [];
+  let currentCategory = "General";
+  let inCodeBlock = false;
+  let featureIndex = 0;
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) continue;
+
+    const trimmed = line.trim();
+
+    // Track heading as category
+    const headingMatch = trimmed.match(/^#{2,4}\s+(.*)/);
+    if (headingMatch) {
+      currentCategory = headingMatch[1].replace(/[^\w\s\-()]/g, "").trim();
+      continue;
+    }
+
+    // Match checkbox items
+    const checkboxMatch = trimmed.match(/^[-*]\s+\[([ xX])\]\s+(.*)/);
+    if (checkboxMatch) {
+      const checked = checkboxMatch[1].toLowerCase() === "x";
+      let description = checkboxMatch[2];
+
+      // Extract bold prefix as a sub-label: **Feature Name**: rest
+      const boldMatch = description.match(/^\*\*([^*]+)\*\*[:\s]*(.*)/);
+      if (boldMatch) {
+        description = `${boldMatch[1]}: ${boldMatch[2]}`.trim();
+        if (description.endsWith(":")) description = description.slice(0, -1);
+      }
+
+      featureIndex++;
+      const id = `f${String(featureIndex).padStart(3, "0")}`;
+
+      features.push({
+        id,
+        category: currentCategory,
+        description,
+        status: checked ? "passed" : "pending",
+      });
+    }
+  }
+
+  return features;
 }

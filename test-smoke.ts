@@ -12,6 +12,8 @@ import {
   createHarnessResetTool,
 } from "./src/tools.js";
 import { renderProgressBar, renderFinalStatus } from "./src/progress.js";
+import * as validation from "./src/validation.js";
+import * as state from "./src/state.js";
 
 const testDir = path.join(os.tmpdir(), `harness-test-${Date.now()}`);
 const runsDir = path.join(testDir, "runs");
@@ -647,6 +649,125 @@ All criteria verified.
     assert("Shows sprint count", output.includes("📦 Sprints: 3/5 completed"));
     assert("Shows blocker", output.includes("Critical regression"));
     assert("Under 4096 chars", output.length <= 4096);
+  }
+
+  // ── 33. Feature extraction from plan ──
+  console.log("\n33. Feature extraction from plan");
+  {
+    const planWithFeatures = `# My Plan
+
+## Phase 1: Core
+
+- [ ] **Feature A**: Build the widget
+- [ ] **Feature B**: Test the widget
+- [x] **Feature C**: Deploy the widget
+
+## Phase 2: Polish
+
+- [ ] Add error handling
+- [ ] Improve performance
+
+\`\`\`
+- [ ] This should be ignored (in code block)
+\`\`\`
+`;
+    const features = validation.extractFeatures(planWithFeatures);
+    assert("Extracts 5 features", features.length === 5, `got ${features.length}`);
+    assert("First feature id is f001", features[0].id === "f001");
+    assert("Category includes Phase 1", features[0].category.includes("Phase 1"));
+    assert("Unchecked = pending", features[0].status === "pending");
+    assert("Checked = passed", features[2].status === "passed");
+    assert("Plain text feature extracted", features[3].description === "Add error handling");
+  }
+
+  // ── 34. Feature sync from checkpoint ──
+  console.log("\n34. Feature sync from checkpoint");
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-feat-"));
+    const runId = "test-feat-sync";
+    const features: state.Feature[] = [
+      { id: "f001", category: "Core", description: "Build the widget", status: "pending" },
+      { id: "f002", category: "Core", description: "Test the widget", status: "pending" },
+      { id: "f003", category: "Polish", description: "Add error handling", status: "pending" },
+    ];
+    state.writeFeatures(tmpDir, runId, features);
+
+    state.syncFeaturesFromCheckpoint(
+      tmpDir, runId,
+      ["Build the widget"],
+      ["Test the widget", "Add error handling"],
+    );
+
+    const updated = state.readFeatures(tmpDir, runId);
+    assert("Completed feature → passed", updated[0].status === "passed");
+    assert("Passed feature gets verifiedAt", updated[0].verifiedAt !== undefined);
+    assert("Pending feature stays pending", updated[1].status === "pending");
+    assert("Other pending stays pending", updated[2].status === "pending");
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // ── 35. Progress file generation ──
+  console.log("\n35. Progress file generation");
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-prog-"));
+    const runId = "test-progress";
+    const runState2: state.RunState = {
+      runId,
+      planPath: "/test/plan.md",
+      taskDescription: "Test Task",
+      startedAt: new Date().toISOString(),
+      phase: "build",
+      round: 1,
+      checkpoints: [new Date().toISOString()],
+      status: "active",
+    };
+    const checkpoint: state.Checkpoint = {
+      timestamp: new Date().toISOString(),
+      phase: "build",
+      completedFeatures: ["Widget A"],
+      pendingFeatures: ["Widget B"],
+      blockers: [],
+      summary: "Making progress",
+    };
+    const features: state.Feature[] = [
+      { id: "f001", category: "Core", description: "Widget A", status: "passed" },
+      { id: "f002", category: "Core", description: "Widget B", status: "pending" },
+    ];
+
+    state.writeProgressFile(tmpDir, runId, runState2, checkpoint, features);
+    const progress = state.readProgressFile(tmpDir, runId);
+    assert("Progress file exists", progress !== null);
+    assert("Contains task description", progress!.includes("Test Task"));
+    assert("Contains passed count", progress!.includes("Passed: 1"));
+    assert("Contains pending count", progress!.includes("Pending: 1"));
+    assert("Contains completed feature", progress!.includes("Widget A"));
+    assert("Contains summary", progress!.includes("Making progress"));
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // ── 36. Feature immutability — passed features don't revert ──
+  console.log("\n36. Feature immutability — passed features don't revert");
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-immut-"));
+    const runId = "test-immut";
+    const features: state.Feature[] = [
+      { id: "f001", category: "Core", description: "Already done", status: "passed", verifiedAt: "2026-01-01T00:00:00Z" },
+      { id: "f002", category: "Core", description: "Still pending", status: "pending" },
+    ];
+    state.writeFeatures(tmpDir, runId, features);
+
+    // Checkpoint that doesn't mention the passed feature
+    state.syncFeaturesFromCheckpoint(
+      tmpDir, runId,
+      [],  // nothing completed this round
+      ["Still pending"],
+    );
+
+    const updated = state.readFeatures(tmpDir, runId);
+    assert("Passed feature stays passed", updated[0].status === "passed");
+    assert("VerifiedAt preserved", updated[0].verifiedAt === "2026-01-01T00:00:00Z");
   }
 
   // Summary

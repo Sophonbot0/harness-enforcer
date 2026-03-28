@@ -14,6 +14,7 @@ export interface RunState {
   telegramChatId?: string;
   telegramThreadId?: string;
   telegramMessageId?: string;
+  verifyCommand?: string;
 }
 
 export interface Checkpoint {
@@ -36,6 +37,15 @@ export interface Delivery {
 export interface DodItem {
   text: string;
   checked: boolean;
+}
+
+export interface Feature {
+  id: string;
+  category: string;
+  description: string;
+  status: "pending" | "in_progress" | "passed" | "failed" | "deferred";
+  verifiedAt?: string;
+  verifiedBy?: string;  // "test" | "build" | "manual" | "lint"
 }
 
 // ─── Concurrency Lock (MEDIUM 3) ───
@@ -141,6 +151,124 @@ export function readDodItems(runsDir: string, runId: string): DodItem[] {
   if (!fs.existsSync(p)) return [];
   const content = fs.readFileSync(p, "utf-8");
   return safeParseJson<DodItem[]>(content, p);
+}
+
+// ─── Features (structured JSON, Anthropic pattern) ───
+
+export function writeFeatures(runsDir: string, runId: string, features: Feature[]): void {
+  const dir = getRunDir(runsDir, runId);
+  ensureDir(dir);
+  safeWriteFile(path.join(dir, "features.json"), JSON.stringify(features, null, 2));
+}
+
+export function readFeatures(runsDir: string, runId: string): Feature[] {
+  const p = path.join(getRunDir(runsDir, runId), "features.json");
+  if (!fs.existsSync(p)) return [];
+  const content = fs.readFileSync(p, "utf-8");
+  return safeParseJson<Feature[]>(content, p);
+}
+
+/**
+ * Update feature statuses based on completed/pending feature names.
+ * Only changes status field — never adds/removes features (immutable list).
+ */
+export function syncFeaturesFromCheckpoint(
+  runsDir: string,
+  runId: string,
+  completedFeatures: string[],
+  pendingFeatures: string[],
+  inProgressFeature?: string,
+): void {
+  const features = readFeatures(runsDir, runId);
+  if (features.length === 0) return;
+
+  const completedSet = new Set(completedFeatures.map(f => f.toLowerCase()));
+  const inProgressLower = inProgressFeature?.toLowerCase();
+
+  for (const feature of features) {
+    const descLower = feature.description.toLowerCase();
+
+    if (completedSet.has(descLower) || completedFeatures.some(c => descLower.includes(c.toLowerCase().slice(0, 30)))) {
+      if (feature.status !== "passed") {
+        feature.status = "passed";
+        if (!feature.verifiedAt) feature.verifiedAt = new Date().toISOString();
+      }
+    } else if (inProgressLower && descLower.includes(inProgressLower.slice(0, 30))) {
+      feature.status = "in_progress";
+    } else if (feature.status === "passed") {
+      // Don't revert passed features
+    } else if (feature.status !== "deferred") {
+      feature.status = "pending";
+    }
+  }
+
+  writeFeatures(runsDir, runId, features);
+}
+
+// ─── Progress File (cross-session memory) ───
+
+export function writeProgressFile(
+  runsDir: string,
+  runId: string,
+  runState: RunState,
+  checkpoint: Checkpoint,
+  features: Feature[],
+): void {
+  const dir = getRunDir(runsDir, runId);
+  ensureDir(dir);
+
+  const passed = features.filter(f => f.status === "passed").length;
+  const failed = features.filter(f => f.status === "failed").length;
+  const inProgress = features.filter(f => f.status === "in_progress").length;
+  const pending = features.filter(f => f.status === "pending").length;
+  const deferred = features.filter(f => f.status === "deferred").length;
+
+  const lines: string[] = [
+    `# Progress — ${runState.taskDescription}`,
+    ``,
+    `**Run ID:** ${runState.runId}`,
+    `**Phase:** ${runState.phase}`,
+    `**Started:** ${runState.startedAt}`,
+    `**Last checkpoint:** ${checkpoint.timestamp}`,
+    `**Checkpoints:** ${runState.checkpoints.length}`,
+    ``,
+    `## Feature Status`,
+    `- ✅ Passed: ${passed}`,
+    `- ❌ Failed: ${failed}`,
+    `- ⏳ In Progress: ${inProgress}`,
+    `- ⬜ Pending: ${pending}`,
+    ...(deferred > 0 ? [`- ⏭️ Deferred: ${deferred}`] : []),
+    `- **Total: ${features.length}**`,
+    ``,
+    `## Completed`,
+    ...checkpoint.completedFeatures.map(f => `- ✅ ${f}`),
+    ``,
+    `## In Progress / Next`,
+    ...checkpoint.pendingFeatures.slice(0, 5).map(f => `- ⬜ ${f}`),
+    ``,
+  ];
+
+  if (checkpoint.blockers.length > 0) {
+    lines.push(`## Blockers`);
+    lines.push(...checkpoint.blockers.map(b => `- 🚫 ${b}`));
+    lines.push(``);
+  }
+
+  lines.push(`## Summary`);
+  lines.push(checkpoint.summary);
+  lines.push(``);
+
+  safeWriteFile(path.join(dir, "progress.md"), lines.join("\n"));
+}
+
+export function readProgressFile(runsDir: string, runId: string): string | null {
+  const p = path.join(getRunDir(runsDir, runId), "progress.md");
+  if (!fs.existsSync(p)) return null;
+  try {
+    return fs.readFileSync(p, "utf-8");
+  } catch {
+    return null;
+  }
 }
 
 export function appendCheckpoint(runsDir: string, runId: string, checkpoint: Checkpoint): void {

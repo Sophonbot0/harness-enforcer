@@ -51,6 +51,10 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Telegram thread/topic ID for progress bar auto-updates (optional, for forum groups).",
         },
+        verifyCommand: {
+          type: "string",
+          description: "Optional command to verify work (e.g. 'npm test', 'vitest run'). Stored in run state and recommended to agent before marking features done.",
+        },
       },
       required: ["planPath", "taskDescription"],
     },
@@ -85,11 +89,13 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
         }
 
         const dodItems = validation.extractDodItems(planContent);
+        const features = validation.extractFeatures(planContent);
         const runId = state.generateRunId();
         const now = new Date().toISOString();
 
         const telegramChatId = validation.readOptionalStringParam(p, "telegramChatId");
         const telegramThreadId = validation.readOptionalStringParam(p, "telegramThreadId");
+        const verifyCommand = validation.readOptionalStringParam(p, "verifyCommand");
 
         const runState: state.RunState = {
           runId,
@@ -102,6 +108,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           status: "active",
           ...(telegramChatId ? { telegramChatId } : {}),
           ...(telegramThreadId ? { telegramThreadId } : {}),
+          ...(verifyCommand ? { verifyCommand } : {}),
         };
 
         state.writeRunState(runsDir, runId, runState);
@@ -110,6 +117,11 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           runId,
           dodItems.map((d) => ({ text: d.text, checked: d.checked })),
         );
+
+        // Write structured features (Anthropic pattern — immutable list)
+        if (features.length > 0) {
+          state.writeFeatures(runsDir, runId, features);
+        }
 
         // Auto-render initial progress bar
         const progressBar = renderProgressBar({
@@ -131,6 +143,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           taskDescription,
           dodItemCount: dodItems.length,
           uncheckedDodItems: dodItems.filter((d) => !d.checked).length,
+          featureCount: features.length,
           progressBar,
         };
 
@@ -190,6 +203,10 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Telegram message ID to edit with updated progress bar. Pass the messageId from harness_start's initial send.",
         },
+        verificationLog: {
+          type: "string",
+          description: "Optional test/build output proving features are complete. Stored as evidence.",
+        },
       },
       required: ["phase", "completedFeatures", "pendingFeatures", "blockers", "summary"],
     },
@@ -238,6 +255,20 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           };
           state.appendCheckpoint(runsDir, runId, checkpoint);
 
+          // Sync features from checkpoint (Anthropic pattern)
+          state.syncFeaturesFromCheckpoint(
+            runsDir,
+            runId,
+            completedFeatures,
+            pendingFeatures,
+          );
+
+          // Write progress file (cross-session memory)
+          const features = state.readFeatures(runsDir, runId);
+          if (features.length > 0) {
+            state.writeProgressFile(runsDir, runId, runState, checkpoint, features);
+          }
+
           const elapsed = elapsedSeconds(runState.startedAt);
           const dodItems = state.readDodItems(runsDir, runId);
 
@@ -265,6 +296,18 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             blockerCount: blockers.length,
             progressBar,
           };
+
+          // Verification reminder (Anthropic insight: don't mark done without testing)
+          if (runState.verifyCommand && pendingFeatures.length > 0) {
+            res.verificationReminder = `⚠️ Before marking features complete, run: ${runState.verifyCommand}`;
+          }
+
+          // Feature status summary
+          if (features.length > 0) {
+            const passed = features.filter(f => f.status === "passed").length;
+            const pending2 = features.filter(f => f.status === "pending").length;
+            res.featureStatus = { passed, pending: pending2, total: features.length };
+          }
 
           // Include Telegram edit instructions if we have the info
           const msgId = resolvedMessageId;
@@ -310,6 +353,10 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Optional absolute path to the challenge-report.md file.",
         },
+        nextPlanPath: {
+          type: "string",
+          description: "Optional path to next plan. On successful delivery, returns instructions to auto-start the next run.",
+        },
       },
       required: ["evalReportPath"],
     },
@@ -324,6 +371,7 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
         const challengeReportPath = rawChallengePath
           ? validation.sanitizePath(rawChallengePath, "challengeReportPath")
           : undefined;
+        const rawNextPlan = validation.readOptionalStringParam(p, "nextPlanPath");
 
         const active = state.findActiveRun(runsDir);
         if (!active) {
@@ -379,10 +427,25 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
         }
 
         if (errors.length > 0) {
+          // Generate recovery hints based on what failed
+          const hints: string[] = [];
+          for (const err of errors) {
+            if (err.includes("unchecked DoD")) {
+              hints.push("ACTION: Open the plan file and check off completed items, or verify and complete the remaining ones.");
+            } else if (err.includes("FAIL")) {
+              hints.push("ACTION: Review the eval report, fix the failing criteria, and re-run evaluation.");
+            } else if (err.includes("CRITICAL")) {
+              hints.push("ACTION: Address each critical challenge — add mitigations or mark as resolved in the challenge report.");
+            } else if (err.includes("Cannot read")) {
+              hints.push("ACTION: Ensure the report file exists at the specified path. Write it if missing.");
+            }
+          }
+
           return jsonResult({
             delivered: false,
             runId,
             errors,
+            recoveryHints: hints,
             hint: "Fix all issues above and call harness_submit again.",
           });
         }
@@ -444,6 +507,12 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
             res.telegramChatId = runState.telegramChatId;
             if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
             res.telegramInstructions = "Edit the Telegram message with the final DELIVERED status using: message action=edit";
+          }
+
+          // Run chaining — auto-continue to next plan
+          if (rawNextPlan) {
+            res.nextPlanPath = rawNextPlan;
+            res.chainingInstruction = `Run delivered successfully. To continue, call harness_start with planPath="${rawNextPlan}" to start the next run.`;
           }
 
           return res;

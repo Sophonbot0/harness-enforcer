@@ -34,6 +34,8 @@ const HALLUCINATION_WINDOW_MS = 5 * 60 * 1000; // 5min window for detecting repe
 const HALLUCINATION_THRESHOLD = 5; // Same tool+args 5x in window → hallucination
 const TOOL_ERROR_WINDOW_MS = 5 * 60 * 1000; // 5min window for error accumulation
 const TOOL_ERROR_THRESHOLD = 5; // 5 errors in window → escalate
+const PROGRESS_STALL_THRESHOLD = 3; // 3 checkpoints with same completed count → stalled
+const SAME_FILE_EDIT_THRESHOLD = 5; // Same file edited 5x without test → warn
 
 // ─── State ───
 let lastTimerUpdateMs = 0;
@@ -268,6 +270,54 @@ export default {
       return null;
     }
 
+    /** Detect progress stall: N consecutive checkpoints with same completed count */
+    function checkProgressStall(runsDir2: string, runId: string): string | null {
+      const checkpoints = state.readCheckpoints(runsDir2, runId);
+      if (checkpoints.length < PROGRESS_STALL_THRESHOLD) return null;
+
+      const recent = checkpoints.slice(-PROGRESS_STALL_THRESHOLD);
+      const counts = recent.map(c => c.completedFeatures.length);
+      const allSame = counts.every(c => c === counts[0]);
+
+      if (allSame) {
+        return `Progress stall: last ${PROGRESS_STALL_THRESHOLD} checkpoints all have ${counts[0]} completed features. Agent may be stuck.`;
+      }
+      return null;
+    }
+
+    /** Track file edits without tests (hallucination pattern v2) */
+    const fileEditCounts = new Map<string, number>();
+    let lastTestRunMs = 0;
+
+    function trackFileEdit(toolName: string, args: unknown): void {
+      if (toolName === "edit" || toolName === "write") {
+        const a = args as Record<string, unknown>;
+        const filePath = (a.file ?? a.filePath ?? a.file_path ?? a.path ?? "") as string;
+        if (filePath) {
+          const count = (fileEditCounts.get(filePath) ?? 0) + 1;
+          fileEditCounts.set(filePath, count);
+        }
+      }
+      // Reset counters when tests are run
+      if (toolName === "exec") {
+        const a = args as Record<string, unknown>;
+        const cmd = (a.command ?? "") as string;
+        if (/\b(test|vitest|jest|pytest|cargo test|go test|npm test)\b/i.test(cmd)) {
+          fileEditCounts.clear();
+          lastTestRunMs = Date.now();
+        }
+      }
+    }
+
+    function checkFileEditWithoutTest(): string | null {
+      for (const [filePath, count] of fileEditCounts) {
+        if (count >= SAME_FILE_EDIT_THRESHOLD) {
+          return `File ${filePath} edited ${count}x without running tests. Consider verifying.`;
+        }
+      }
+      return null;
+    }
+
     // ─── Stale run check (periodic, piggybacked on tool calls) ───
     let lastStaleCheckMs = 0;
 
@@ -324,19 +374,41 @@ export default {
       // ── Watchdog checks (only during active runs) ──
       const activeForWatchdog = state.findActiveRun(runsDir);
       if (activeForWatchdog && !HARNESS_TOOLS.has(event.toolName)) {
+        // Track file edits
+        trackFileEdit(event.toolName, event.arguments);
+
         const hallucination = checkForHallucination(
           event.toolName,
           hashArgs(event.arguments),
         );
         if (hallucination) {
           api.logger.warn(`[harness-enforcer] ${hallucination}`);
-          // Don't auto-cancel for hallucination yet — just log and alert
-          // In Phase 3 we can add auto-recovery
         }
 
         const errorBurst = checkForErrorBurst();
         if (errorBurst) {
           api.logger.warn(`[harness-enforcer] ${errorBurst}`);
+          // Send Telegram alert on error burst
+          const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+          try {
+            await api.runtime.channel.telegram.sendMessageTelegram(
+              alertChat,
+              `⚠️ **Watchdog Alert**\n${errorBurst}\nRun: ${activeForWatchdog.state.taskDescription}`,
+              {},
+            );
+          } catch { /* best effort */ }
+        }
+
+        // Check for file edit without test
+        const editWarn = checkFileEditWithoutTest();
+        if (editWarn) {
+          api.logger.warn(`[harness-enforcer] ${editWarn}`);
+        }
+
+        // Check for progress stall
+        const stall = checkProgressStall(runsDir, activeForWatchdog.runId);
+        if (stall) {
+          api.logger.warn(`[harness-enforcer] ${stall}`);
         }
       }
 
@@ -434,7 +506,7 @@ export default {
       }
 
       lastTimerUpdateMs = now;
-      api.logger.info(
+      api.logger.debug(
         `[harness-enforcer] Timer update (${event.toolName})`,
       );
     });
