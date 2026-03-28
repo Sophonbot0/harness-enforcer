@@ -54,9 +54,11 @@ const recentToolCalls: ToolCallRecord[] = [];
 
 function hashArgs(args: unknown): string {
   try {
-    return JSON.stringify(args).slice(0, 200);
+    if (args === undefined || args === null) return "empty";
+    const s = JSON.stringify(args);
+    return s ? s.slice(0, 200) : "empty";
   } catch {
-    return "?";
+    return "unknown";
   }
 }
 
@@ -440,7 +442,10 @@ export default {
 
     // ─── HOOK 1: after_tool_call — main orchestrator ───
     api.on("after_tool_call", async (event, ctx) => {
-      // Track tool call for watchdog
+      // Debug: log every tool call to verify hook is firing
+      const argsHashDebug = hashArgs(event.arguments);
+      const hasActiveRun = !!state.findActiveRunForSession(runsDir, ctx.sessionKey);
+      api.logger.info(`[harness-enforcer] after_tool_call: ${event.toolName} session=${ctx.sessionKey} hash=${argsHashDebug} recentCalls=${recentToolCalls.length} activeRun=${hasActiveRun}`);
       const isError =
         event.result &&
         typeof event.result === "object" &&
@@ -476,7 +481,7 @@ export default {
           hashArgs(event.arguments),
         );
         if (hallucination) {
-          api.logger.warn(`[harness-enforcer] ${hallucination}`);
+          api.logger.info(`[harness-enforcer] HALLUCINATION DETECTED: ${hallucination}`);
           // Send Telegram alert ONCE per cooldown period (5 min)
           if (canSendAlert("hallucination")) {
             const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
@@ -491,6 +496,7 @@ export default {
           // Self-correction: inject system note to force the agent to change approach
           try {
             if (ctx.injectSystemNote) {
+              api.logger.info(`[harness-enforcer] Injecting hallucination system note`);
               await ctx.injectSystemNote(
                 `🛑 HALLUCINATION LOOP DETECTED — STOP AND CHANGE APPROACH\n\n` +
                 `${hallucination}\n\n` +
