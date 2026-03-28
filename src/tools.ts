@@ -31,7 +31,8 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
     label: "Harness Start",
     description:
       "Initialise a new harness run. Creates a run directory, records the plan, and extracts DoD items. " +
-      "Call this at the start of every harness pipeline. Only one active run is allowed at a time.",
+      "Call this at the start of every harness pipeline. Only one active run is allowed at a time. " +
+      "SILENT WORK MODE: During a harness run, do NOT send separate progress messages. Use harness_checkpoint with currentAction to update the progress bar instead.",
     parameters: {
       type: "object",
       properties: {
@@ -152,6 +153,7 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
           result.telegramChatId = telegramChatId;
           if (telegramThreadId) result.telegramThreadId = telegramThreadId;
           result.telegramInstructions = "Send progressBar as a Telegram message using 'message action=send'. Save the returned messageId and pass it to harness_checkpoint as telegramMessageId.";
+          result.silentWorkMode = "⚠️ IMPORTANT: Do NOT send separate progress messages during the harness run. Use harness_checkpoint with currentAction to update the progress bar instead. All work status goes through the progress bar edit, not new messages.";
         }
 
         return jsonResult(result);
@@ -207,6 +209,10 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           type: "string",
           description: "Optional test/build output proving features are complete. Stored as evidence.",
         },
+        currentAction: {
+          type: "string",
+          description: "What the agent is currently doing. Shown in the progress bar work log instead of sending separate messages.",
+        },
       },
       required: ["phase", "completedFeatures", "pendingFeatures", "blockers", "summary"],
     },
@@ -220,6 +226,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
         const summary = validation.readStringParam(p, "summary");
         const telegramMessageId = validation.readOptionalStringParam(p, "telegramMessageId");
         const verificationLog = validation.readOptionalStringParam(p, "verificationLog");
+        const currentAction = validation.readOptionalStringParam(p, "currentAction");
 
         const active = state.findActiveRun(runsDir);
         if (!active) {
@@ -274,6 +281,15 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
           const elapsed = elapsedSeconds(runState.startedAt);
           const dodItems = state.readDodItems(runsDir, runId);
 
+          // Update work log with current action
+          if (currentAction) {
+            const log = runState.workLog ?? [];
+            log.push(currentAction);
+            // Keep only last 5 entries
+            runState.workLog = log.slice(-5);
+            state.writeRunState(runsDir, runId, runState);
+          }
+
           // Auto-render progress bar
           const progressBar = renderProgressBar({
             taskDescription: runState.taskDescription,
@@ -284,6 +300,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             dodTotal: dodItems.length,
             dodCompleted: completedFeatures.length,
             elapsedSeconds: elapsed,
+            workLog: runState.workLog,
           });
 
           const res: Record<string, unknown> = {

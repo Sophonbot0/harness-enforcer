@@ -770,6 +770,63 @@ All criteria verified.
     assert("VerifiedAt preserved", updated[0].verifiedAt === "2026-01-01T00:00:00Z");
   }
 
+  // ── 37. Work log in progress bar ──
+  console.log("\n37. Work log in progress bar");
+  {
+    const bar = renderProgressBar({
+      taskDescription: "Test Work Log",
+      phase: "build",
+      completedFeatures: ["Done A"],
+      pendingFeatures: ["Pending B"],
+      blockers: [],
+      dodTotal: 4,
+      dodCompleted: 2,
+      elapsedSeconds: 120,
+      workLog: ["Editing state.ts", "Running tests", "Pushing to GitHub"],
+    });
+    assert("Contains work log marker", bar.includes("📝"));
+    assert("Shows last action", bar.includes("Pushing to GitHub"));
+    assert("Shows earlier action", bar.includes("Running tests"));
+    assert("Under 4096 chars", bar.length <= 4096);
+  }
+
+  // ── 38. Work log truncation ──
+  console.log("\n38. Work log truncation (max 5 entries)");
+  {
+    const bar = renderProgressBar({
+      taskDescription: "Test Truncation",
+      phase: "build",
+      completedFeatures: [],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 1,
+      dodCompleted: 0,
+      elapsedSeconds: 60,
+      workLog: ["Action 1", "Action 2", "Action 3", "Action 4", "Action 5", "Action 6", "Action 7"],
+    });
+    // Should only show last 5
+    assert("Does not show Action 1", !bar.includes("Action 1"));
+    assert("Does not show Action 2", !bar.includes("Action 2"));
+    assert("Shows Action 3", bar.includes("Action 3"));
+    assert("Shows Action 7", bar.includes("Action 7"));
+  }
+
+  // ── 39. Empty work log doesn't render ──
+  console.log("\n39. Empty work log doesn't render");
+  {
+    const bar = renderProgressBar({
+      taskDescription: "No Log",
+      phase: "plan",
+      completedFeatures: [],
+      pendingFeatures: [],
+      blockers: [],
+      dodTotal: 1,
+      dodCompleted: 0,
+      elapsedSeconds: 10,
+    });
+    assert("No work log marker", !bar.includes("📝"));
+  }
+
   // Summary
   console.log(`\n${"─".repeat(40)}`);
   console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);

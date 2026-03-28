@@ -22,6 +22,7 @@ export interface ProgressBarParams {
   elapsedSeconds: number;
   sprintCurrent?: number;  // e.g. 2 (1-indexed)
   sprintTotal?: number;    // e.g. 4
+  workLog?: string[];      // Last N action lines shown at bottom
 }
 
 function formatDuration(seconds: number): string {
@@ -88,6 +89,13 @@ function renderBlockers(blockers: string[]): string {
   return `\n⚠️ Blockers:\n${lines.join("\n")}`;
 }
 
+function renderWorkLog(workLog: string[] | undefined): string {
+  if (!workLog || workLog.length === 0) return "";
+  // Show last 5 entries max, truncate each
+  const entries = workLog.slice(-5).map(l => `› ${truncate(l, 50)}`);
+  return `\n📝 ${entries.join("\n📝 ")}`;
+}
+
 function renderSprintStatusLine(current: number, total: number): string {
   const parts: string[] = [];
   for (let i = 1; i <= total; i++) {
@@ -121,6 +129,7 @@ export function renderProgressBar(params: ProgressBarParams): string {
     elapsedSeconds,
     sprintCurrent,
     sprintTotal,
+    workLog,
   } = params;
 
   const safeDodTotal = Math.max(dodTotal, 0);
@@ -158,6 +167,11 @@ export function renderProgressBar(params: ProgressBarParams): string {
 
   if (blockerSection) {
     parts.push(blockerSection);
+  }
+
+  const workLogSection = renderWorkLog(workLog);
+  if (workLogSection) {
+    parts.push(workLogSection);
   }
 
   let result = parts.join("\n");

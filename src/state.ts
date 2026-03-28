@@ -15,6 +15,7 @@ export interface RunState {
   telegramThreadId?: string;
   telegramMessageId?: string;
   verifyCommand?: string;
+  workLog?: string[];  // Last N action entries for progress bar
 }
 
 export interface Checkpoint {
