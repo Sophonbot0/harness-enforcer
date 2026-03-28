@@ -419,6 +419,15 @@ export default {
         );
         if (hallucination) {
           api.logger.warn(`[harness-enforcer] ${hallucination}`);
+          // Send Telegram alert on hallucination
+          const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+          try {
+            await api.runtime.channel.telegram.sendMessageTelegram(
+              alertChat,
+              `🔄 **Hallucination Loop Detected**\n${hallucination}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_The run continues but the agent may be stuck._`,
+              {},
+            );
+          } catch { /* best effort */ }
         }
 
         const errorBurst = checkForErrorBurst();
@@ -445,6 +454,15 @@ export default {
         const stall = checkProgressStall(runsDir, activeForWatchdog.runId);
         if (stall) {
           api.logger.warn(`[harness-enforcer] ${stall}`);
+          // Send Telegram escalation on stall
+          const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+          try {
+            await api.runtime.channel.telegram.sendMessageTelegram(
+              alertChat,
+              `⏸ **Progress Stalled**\n${stall}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_${PROGRESS_STALL_THRESHOLD} checkpoints with no new features completed._`,
+              {},
+            );
+          } catch { /* best effort */ }
         }
       }
 

@@ -980,7 +980,18 @@ export function createHarnessStatusTool(runsDir: string, sessionCtx: SessionCont
           elapsed: formatDuration(elapsed),
           elapsedSeconds: elapsed,
           checkpointCount: checkpoints.length,
+          sessionKey: runState.sessionKey ?? "unscoped (legacy)",
         };
+
+        // Show how many concurrent runs are active
+        const allActive = state.findAllActiveRuns(runsDir);
+        if (allActive.length > 1) {
+          result.concurrentRuns = allActive.map(r => ({
+            runId: r.runId,
+            task: r.state.taskDescription.slice(0, 60),
+            sessionKey: r.state.sessionKey ?? "unscoped",
+          }));
+        }
 
         if (latestCheckpoint) {
           result.latestCheckpoint = {
