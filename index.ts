@@ -414,8 +414,28 @@ export default {
     }
 
     // ─── HOOK 0: before_tool_call — set session context for tools ───
-    api.on("before_tool_call", async (_event, ctx) => {
+    api.on("before_tool_call", async (event, ctx) => {
       sessionContext.currentSessionKey = ctx.sessionKey;
+
+      // Silent work mode: intercept message sends during active harness runs
+      const toolEvent = event as { toolName?: string };
+      if (toolEvent.toolName === "message") {
+        const active = state.findActiveRunForSession(runsDir, ctx.sessionKey);
+        if (active) {
+          // Inject system note telling the agent to stop sending messages
+          try {
+            if (ctx.injectSystemNote) {
+              await ctx.injectSystemNote(
+                `🔇 SILENT WORK MODE VIOLATION\n\n` +
+                `You just tried to send a message during an active harness run. ` +
+                `This creates spam. ALL updates must go through harness_checkpoint with currentAction.\n\n` +
+                `Do NOT send messages. Do NOT explain what you're doing. ` +
+                `Work silently: read → edit → exec → checkpoint. Repeat.`
+              );
+            }
+          } catch { /* best effort */ }
+        }
+      }
     });
 
     // ─── HOOK 1: after_tool_call — main orchestrator ───
@@ -468,6 +488,24 @@ export default {
               );
             } catch { /* best effort */ }
           }
+          // Self-correction: inject system note to force the agent to change approach
+          try {
+            if (ctx.injectSystemNote) {
+              await ctx.injectSystemNote(
+                `🛑 HALLUCINATION LOOP DETECTED — STOP AND CHANGE APPROACH\n\n` +
+                `${hallucination}\n\n` +
+                `You are calling the same tool with identical arguments repeatedly. This is NOT making progress.\n\n` +
+                `MANDATORY ACTIONS:\n` +
+                `1. STOP calling ${event.toolName} with these arguments\n` +
+                `2. Analyze WHY it's not working — read the error or output carefully\n` +
+                `3. Try a COMPLETELY DIFFERENT approach to solve this step\n` +
+                `4. If stuck, skip this feature and move to the next one\n` +
+                `5. Call harness_checkpoint to record your new approach`
+              );
+            }
+          } catch { /* best effort */ }
+          // Reset the hallucination counter so it doesn't keep re-triggering
+          recentToolCalls.length = 0;
         }
 
         const errorBurst = checkForErrorBurst();

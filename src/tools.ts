@@ -38,7 +38,10 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
     description:
       "Initialise a new harness run. Creates a run directory, records the plan, and extracts DoD items. " +
       "Call this at the start of every harness pipeline. Only one active run is allowed at a time. " +
-      "SILENT WORK MODE: During a harness run, do NOT send separate progress messages. Use harness_checkpoint with currentAction to update the progress bar instead.",
+      "SILENT WORK MODE: During a harness run, do NOT send separate progress messages. " +
+      "Do NOT send any text messages to the chat. Do NOT use the message tool. " +
+      "Use harness_checkpoint with currentAction to update the progress bar instead. " +
+      "Work silently: read, edit, exec, checkpoint. Only speak after harness_submit.",
     parameters: {
       type: "object",
       properties: {
@@ -185,7 +188,16 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           result.telegramAutoManaged = true;
           result.telegramChatId = telegramChatId;
           if (telegramThreadId) result.telegramThreadId = telegramThreadId;
-          result.silentWorkMode = "⚠️ IMPORTANT: The plugin auto-sends and auto-edits the Telegram progress bar. Do NOT send or edit any Telegram messages yourself during this harness run. Just call harness_checkpoint to update progress — the bar updates automatically.";
+          result.silentWorkMode =
+            "⚠️ SILENT WORK MODE ACTIVE — ZERO MESSAGES ALLOWED\n\n" +
+            "During this harness run:\n" +
+            "• Do NOT send ANY text messages to the chat\n" +
+            "• Do NOT call the message tool\n" +
+            "• Do NOT explain what you're doing in chat\n" +
+            "• ALL status updates go through harness_checkpoint with currentAction field\n" +
+            "• The progress bar auto-updates on every checkpoint — that IS your communication channel\n" +
+            "• Work silently: read → edit → exec → checkpoint. Repeat.\n" +
+            "• Only speak when the run is DELIVERED (after harness_submit)";
         }
 
         return jsonResult(result);
