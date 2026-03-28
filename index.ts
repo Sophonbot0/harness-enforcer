@@ -416,26 +416,43 @@ export default {
     }
 
     // ─── HOOK 0: before_tool_call — set session context for tools ───
+    // Track hallucination state for blocking in before_tool_call
+    let lastHallucinationToolName: string | null = null;
+    let lastHallucinationArgsHash: string | null = null;
+
     api.on("before_tool_call", async (event, ctx) => {
       sessionContext.currentSessionKey = ctx.sessionKey;
 
+      const toolEvent = event as { toolName?: string; params?: Record<string, unknown> };
+
+      // Block repeated calls that were flagged as hallucination
+      if (lastHallucinationToolName && toolEvent.toolName === lastHallucinationToolName) {
+        const currentHash = hashArgs(toolEvent.params);
+        if (currentHash === lastHallucinationArgsHash) {
+          api.logger.info(`[harness-enforcer] BLOCKING hallucinated call: ${toolEvent.toolName}`);
+          // Clear after blocking once — give agent a chance to try something else
+          lastHallucinationToolName = null;
+          lastHallucinationArgsHash = null;
+          return {
+            block: true,
+            blockReason:
+              `🛑 BLOCKED — Hallucination loop detected. You called ${toolEvent.toolName} with identical arguments too many times. ` +
+              `STOP and try a completely different approach. If stuck, skip this step and move to the next feature. ` +
+              `Call harness_checkpoint to record your new approach.`,
+          };
+        }
+      }
+
       // Silent work mode: intercept message sends during active harness runs
-      const toolEvent = event as { toolName?: string };
       if (toolEvent.toolName === "message") {
         const active = state.findActiveRunForSession(runsDir, ctx.sessionKey);
         if (active) {
-          // Inject system note telling the agent to stop sending messages
-          try {
-            if (ctx.injectSystemNote) {
-              await ctx.injectSystemNote(
-                `🔇 SILENT WORK MODE VIOLATION\n\n` +
-                `You just tried to send a message during an active harness run. ` +
-                `This creates spam. ALL updates must go through harness_checkpoint with currentAction.\n\n` +
-                `Do NOT send messages. Do NOT explain what you're doing. ` +
-                `Work silently: read → edit → exec → checkpoint. Repeat.`
-              );
-            }
-          } catch { /* best effort */ }
+          return {
+            block: true,
+            blockReason:
+              `🔇 SILENT WORK MODE — Message blocked. During a harness run, do NOT send messages. ` +
+              `Use harness_checkpoint with currentAction instead. Work silently: read → edit → exec → checkpoint.`,
+          };
         }
       }
     });
@@ -482,34 +499,28 @@ export default {
         );
         if (hallucination) {
           api.logger.info(`[harness-enforcer] HALLUCINATION DETECTED: ${hallucination}`);
+          
+          // Set blocking state for before_tool_call
+          lastHallucinationToolName = event.toolName;
+          lastHallucinationArgsHash = hashArgs(event.params);
+          
           // Send Telegram alert ONCE per cooldown period (5 min)
           if (canSendAlert("hallucination")) {
             const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+            const threadId = activeForWatchdog.state.telegramThreadId;
             try {
               await api.runtime.channel.telegram.sendMessageTelegram(
                 alertChat,
-                `🔄 **Hallucination Loop Detected**\n${hallucination}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_The run continues but the agent may be stuck._`,
-                {},
+                `🔄 **Hallucination Loop Detected**\n${hallucination}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_Auto-correction active: next identical call will be blocked._`,
+                {
+                  ...(threadId ? { messageThreadId: parseInt(threadId, 10) } : {}),
+                },
               );
-            } catch { /* best effort */ }
-          }
-          // Self-correction: inject system note to force the agent to change approach
-          try {
-            if (ctx.injectSystemNote) {
-              api.logger.info(`[harness-enforcer] Injecting hallucination system note`);
-              await ctx.injectSystemNote(
-                `🛑 HALLUCINATION LOOP DETECTED — STOP AND CHANGE APPROACH\n\n` +
-                `${hallucination}\n\n` +
-                `You are calling the same tool with identical arguments repeatedly. This is NOT making progress.\n\n` +
-                `MANDATORY ACTIONS:\n` +
-                `1. STOP calling ${event.toolName} with these arguments\n` +
-                `2. Analyze WHY it's not working — read the error or output carefully\n` +
-                `3. Try a COMPLETELY DIFFERENT approach to solve this step\n` +
-                `4. If stuck, skip this feature and move to the next one\n` +
-                `5. Call harness_checkpoint to record your new approach`
-              );
+              api.logger.info(`[harness-enforcer] Telegram hallucination alert sent`);
+            } catch (err) {
+              api.logger.info(`[harness-enforcer] Telegram send failed: ${err instanceof Error ? err.message : String(err)}`);
             }
-          } catch { /* best effort */ }
+          }
           // Reset the hallucination counter so it doesn't keep re-triggering
           recentToolCalls.length = 0;
         }
