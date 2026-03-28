@@ -443,7 +443,7 @@ export default {
     // ─── HOOK 1: after_tool_call — main orchestrator ───
     api.on("after_tool_call", async (event, ctx) => {
       // Debug: log every tool call to verify hook is firing
-      const argsHashDebug = hashArgs(event.arguments);
+      const argsHashDebug = hashArgs(event.params);
       const hasActiveRun = !!state.findActiveRunForSession(runsDir, ctx.sessionKey);
       api.logger.info(`[harness-enforcer] after_tool_call: ${event.toolName} session=${ctx.sessionKey} hash=${argsHashDebug} recentCalls=${recentToolCalls.length} activeRun=${hasActiveRun}`);
       const isError =
@@ -457,7 +457,7 @@ export default {
 
       recentToolCalls.push({
         toolName: event.toolName,
-        argsHash: hashArgs(event.arguments),
+        argsHash: hashArgs(event.params),
         timestamp: Date.now(),
         isError: !!isError,
       });
@@ -474,11 +474,11 @@ export default {
       const activeForWatchdog = state.findActiveRunForSession(runsDir, ctx.sessionKey);
       if (activeForWatchdog && !HARNESS_TOOLS.has(event.toolName)) {
         // Track file edits
-        trackFileEdit(event.toolName, event.arguments);
+        trackFileEdit(event.toolName, event.params);
 
         const hallucination = checkForHallucination(
           event.toolName,
-          hashArgs(event.arguments),
+          hashArgs(event.params),
         );
         if (hallucination) {
           api.logger.info(`[harness-enforcer] HALLUCINATION DETECTED: ${hallucination}`);
