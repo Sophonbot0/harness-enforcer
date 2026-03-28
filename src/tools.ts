@@ -66,6 +66,10 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           type: "string",
           description: "Optional parent run ID to link sub-plans for orchestration. Enables future multi-plan hierarchies.",
         },
+        isSubagent: {
+          type: "boolean",
+          description: "Set to true when running inside a subagent. Enables shorter stale timeout and auto-report to parent manifest.",
+        },
       },
       required: ["planPath", "taskDescription"],
     },
@@ -109,6 +113,7 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
         const telegramThreadId = validation.readOptionalStringParam(p, "telegramThreadId");
         const verifyCommand = validation.readOptionalStringParam(p, "verifyCommand");
         const parentRunId = validation.readOptionalStringParam(p, "parentRunId");
+        const isSubagent = p.isSubagent as boolean | undefined;
 
         const runState: state.RunState = {
           runId,
@@ -124,6 +129,7 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           ...(telegramThreadId ? { telegramThreadId } : {}),
           ...(verifyCommand ? { verifyCommand } : {}),
           ...(parentRunId ? { parentRunId } : {}),
+          ...(isSubagent ? { isSubagent: true } : {}),
         };
 
         state.writeRunState(runsDir, runId, runState);
@@ -250,6 +256,10 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
             nextSteps: { type: "array", items: { type: "string" }, description: "What should happen next (for resume)." },
           },
         },
+        gate: {
+          type: "string",
+          description: "Optional quality gate level: lint, unit, integration, e2e. Gates must progress sequentially — can't skip from lint to e2e.",
+        },
       },
       required: ["phase", "completedFeatures", "pendingFeatures", "blockers", "summary"],
     },
@@ -265,6 +275,7 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
         const verificationLog = validation.readOptionalStringParam(p, "verificationLog");
         const currentAction = validation.readOptionalStringParam(p, "currentAction");
         const contextSnapshot = p.contextSnapshot as state.ContextSnapshot | undefined;
+        const gate = validation.readOptionalStringParam(p, "gate") as "lint" | "unit" | "integration" | "e2e" | undefined;
 
         const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
         if (!active) {
@@ -275,6 +286,37 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
         }
 
         const { runId, state: runState } = active;
+
+        // Quality gate validation — enforce sequential progression
+        const GATE_ORDER = ["lint", "unit", "integration", "e2e"] as const;
+        if (gate) {
+          const gateIndex = GATE_ORDER.indexOf(gate);
+          if (gateIndex === -1) {
+            return jsonResult({
+              error: `Invalid gate "${gate}". Valid gates: ${GATE_ORDER.join(", ")}`,
+            });
+          }
+          // Check previous checkpoints for the highest gate reached
+          const checkpoints = state.readCheckpoints(runsDir, runId);
+          let highestGateIndex = -1;
+          for (const cp of checkpoints) {
+            const cpGate = (cp as Record<string, unknown>).gate as string | undefined;
+            if (cpGate) {
+              const idx = GATE_ORDER.indexOf(cpGate as typeof GATE_ORDER[number]);
+              if (idx > highestGateIndex) highestGateIndex = idx;
+            }
+          }
+          // Can only advance by 1 gate at a time (or start at lint)
+          if (gateIndex > highestGateIndex + 1) {
+            const expectedGate = GATE_ORDER[highestGateIndex + 1];
+            return jsonResult({
+              error: `Gate skip detected: trying "${gate}" but "${expectedGate}" hasn't passed yet.`,
+              hint: `Gates must progress sequentially: ${GATE_ORDER.join(" → ")}. Complete "${expectedGate}" first.`,
+              currentGate: highestGateIndex >= 0 ? GATE_ORDER[highestGateIndex] : "none",
+              requestedGate: gate,
+            });
+          }
+        }
 
         // Resolve telegramMessageId: param > state > null
         const resolvedMessageId = telegramMessageId ?? runState.telegramMessageId;
@@ -300,6 +342,7 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
             summary,
             ...(verificationLog ? { verificationLog: verificationLog.slice(0, 5000) } : {}),
             ...(contextSnapshot ? { contextSnapshot } : {}),
+            ...(gate ? { gate } : {}),
           };
           state.appendCheckpoint(runsDir, runId, checkpoint);
 
@@ -379,6 +422,39 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
             res.telegramChatId = runState.telegramChatId;
             if (runState.telegramMessageId) res.telegramMessageId = runState.telegramMessageId;
             if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
+          }
+
+          // File conflict detection across concurrent runs
+          if (contextSnapshot?.filesModified && contextSnapshot.filesModified.length > 0) {
+            const allActive = state.findAllActiveRuns(runsDir);
+            const conflicts: string[] = [];
+            for (const other of allActive) {
+              if (other.runId === runId) continue;
+              const otherFiles = other.state.lastContextSnapshot?.filesModified;
+              if (!otherFiles) continue;
+              const overlap = contextSnapshot.filesModified.filter(f => otherFiles.includes(f));
+              if (overlap.length > 0) {
+                conflicts.push(
+                  `Run "${other.state.taskDescription}" also modifies: ${overlap.join(", ")}`
+                );
+              }
+            }
+            if (conflicts.length > 0) {
+              res.fileConflictWarning = `⚠️ FILE CONFLICTS DETECTED:\n${conflicts.join("\n")}\nCoordinate changes to avoid overwrites.`;
+            }
+          }
+
+          // Auto-fix instruction when verification log shows failures
+          if (verificationLog) {
+            const hasFailure = /fail|error|FAIL|ERROR|✗|✘|FAILED/i.test(verificationLog)
+              && !/0 fail/i.test(verificationLog);
+            if (hasFailure) {
+              res.autoFixInstruction =
+                `🔧 AUTO-FIX: Test failures detected in verification log. ` +
+                `Fix the failing tests before calling harness_checkpoint again. ` +
+                `Do NOT mark features as complete until tests pass. ` +
+                `Run the verify command again after fixing: ${runState.verifyCommand ?? "check your tests"}`;
+            }
           }
 
           return res;
@@ -643,8 +719,20 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
                     title: p.title,
                     path: p.path,
                   }));
-                  res.parallelHint = `${parallelReady.length} plans can run in parallel. ` +
-                    `Use sessions_spawn for each parallel plan if multi-agent is available.`;
+                  // Build spawn instructions for each parallel plan
+                  const spawnInstructions = parallelReady
+                    .filter(p => p.phase !== nextPlan.phase) // Exclude the one we're auto-chaining to
+                    .map(p =>
+                      `sessions_spawn({ task: "Execute harness plan: ${p.title}", ` +
+                      `label: "harness-phase-${p.phase}" }) — then inside the subagent: ` +
+                      `harness_start({ planPath: "${p.path}", parentRunId: "${manifest.manifestId}", ` +
+                      `isSubagent: true })`
+                    );
+                  res.parallelHint =
+                    `🔀 ${parallelReady.length} plans can run in parallel! ` +
+                    `You are auto-chaining to Phase ${nextPlan.phase}. ` +
+                    `Spawn subagents for the rest:\n` +
+                    spawnInstructions.join("\n");
                 }
               } else {
                 state.writeManifest(runsDir, manifest);

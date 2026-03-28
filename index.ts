@@ -350,6 +350,25 @@ export default {
       return null;
     }
 
+    /** Check for file conflicts across concurrent active runs */
+    function checkFileConflicts(currentRunId: string, currentFiles: string[]): string | null {
+      if (currentFiles.length === 0) return null;
+      const activeRuns = state.findAllActiveRuns(runsDir);
+      const conflicts: string[] = [];
+      for (const other of activeRuns) {
+        if (other.runId === currentRunId) continue;
+        const otherSnapshot = other.state.lastContextSnapshot;
+        if (!otherSnapshot?.filesModified) continue;
+        const overlap = currentFiles.filter(f => otherSnapshot.filesModified!.includes(f));
+        if (overlap.length > 0) {
+          conflicts.push(
+            `⚠️ Files ${overlap.join(", ")} also modified by run "${other.state.taskDescription}" (${other.runId})`
+          );
+        }
+      }
+      return conflicts.length > 0 ? conflicts.join("\n") : null;
+    }
+
     // ─── Stale run check (periodic, piggybacked on tool calls) ───
     let lastStaleCheckMs = 0;
 
@@ -368,10 +387,15 @@ export default {
 
         const sinceLastActivity = now - lastActivity;
 
-        if (sinceLastActivity > STALE_RUN_TIMEOUT_MS) {
+        // Subagent runs have shorter stale timeout (30min vs 2h)
+        const staleTimeout = active.state.isSubagent
+          ? 30 * 60 * 1000  // 30 minutes for subagents
+          : STALE_RUN_TIMEOUT_MS;
+
+        if (sinceLastActivity > staleTimeout) {
           await autoCancel(
             active,
-            `Stale run: ${Math.round(sinceLastActivity / 60000)}min since last checkpoint (limit: ${STALE_RUN_TIMEOUT_MS / 60000}min)`,
+            `Stale run: ${Math.round(sinceLastActivity / 60000)}min since last checkpoint (limit: ${Math.round(staleTimeout / 60000)}min)`,
           );
         }
       }

@@ -18,6 +18,7 @@ export interface RunState {
   verifyCommand?: string;
   workLog?: string[];  // Last N action entries for progress bar
   parentRunId?: string;  // Links sub-plans to a parent run for orchestration
+  isSubagent?: boolean;  // Running inside a subagent — shorter stale timeout
   resumedFrom?: string;  // If this run was resumed from a cancelled/stale run
   lastContextSnapshot?: ContextSnapshot;  // Latest context snapshot for recovery
 }
