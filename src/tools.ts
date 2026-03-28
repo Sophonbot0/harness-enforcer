@@ -499,17 +499,21 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
           state.writeDelivery(runsDir, runId, delivery);
 
           // Auto-render final status bar
+          // On PASS: force 100% — all features are complete (DoD was validated)
           const dodItems = state.readDodItems(runsDir, runId);
+          const allFeatureNames = lastCheckpoint
+            ? [...lastCheckpoint.completedFeatures, ...lastCheckpoint.pendingFeatures]
+            : dodItems.map(d => d.text);
           const progressBar = renderFinalStatus({
             taskDescription: runState.taskDescription,
             status: "pass",
             evalGrade,
             dodTotal: dodItems.length,
-            dodCompleted: lastCheckpoint ? lastCheckpoint.completedFeatures.length : dodItems.length,
+            dodCompleted: dodItems.length, // PASS = 100%
             elapsedSeconds: elapsed,
-            completedFeatures: lastCheckpoint ? lastCheckpoint.completedFeatures : [],
-            pendingFeatures: lastCheckpoint ? lastCheckpoint.pendingFeatures : [],
-            blockers: lastCheckpoint ? lastCheckpoint.blockers : [],
+            completedFeatures: allFeatureNames, // All features are done on PASS
+            pendingFeatures: [],
+            blockers: [],
           });
 
           const res: Record<string, unknown> = {
