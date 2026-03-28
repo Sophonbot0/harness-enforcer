@@ -219,6 +219,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
         const blockers = validation.readStringArrayParam(p, "blockers");
         const summary = validation.readStringParam(p, "summary");
         const telegramMessageId = validation.readOptionalStringParam(p, "telegramMessageId");
+        const verificationLog = validation.readOptionalStringParam(p, "verificationLog");
 
         const active = state.findActiveRun(runsDir);
         if (!active) {
@@ -252,6 +253,7 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             pendingFeatures,
             blockers,
             summary,
+            ...(verificationLog ? { verificationLog: verificationLog.slice(0, 5000) } : {}),
           };
           state.appendCheckpoint(runsDir, runId, checkpoint);
 
@@ -426,6 +428,19 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
           }
         }
 
+        // 4. Check feature verification (warn, not block)
+        const warnings: string[] = [];
+        const features = state.readFeatures(runsDir, runId);
+        if (features.length > 0) {
+          const unverified = features.filter(f => f.status === "passed" && !f.verifiedAt);
+          if (unverified.length > 0) {
+            warnings.push(
+              `${unverified.length} feature(s) marked passed without verification evidence:\n` +
+                unverified.map(f => `  ⚠️ ${f.description}`).join("\n")
+            );
+          }
+        }
+
         if (errors.length > 0) {
           // Generate recovery hints based on what failed
           const hints: string[] = [];
@@ -498,6 +513,7 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
             checkpointCount: checkpoints.length,
             message: "All quality gates passed. Run delivered successfully.",
             progressBar,
+            ...(warnings.length > 0 ? { warnings } : {}),
           };
 
           // Include Telegram edit instructions
@@ -644,6 +660,25 @@ export function createHarnessStatusTool(runsDir: string): AnyAgentTool {
         const p = params as Record<string, unknown>;
         const requestedRunId = validation.readOptionalStringParam(p, "runId");
 
+        // Special case: runId=all → return summary of all runs
+        if (requestedRunId === "all") {
+          const allRuns = state.listAllRuns(runsDir);
+          const summary = {
+            totalRuns: allRuns.length,
+            completed: allRuns.filter(r => r.status === "completed").length,
+            cancelled: allRuns.filter(r => r.status === "cancelled").length,
+            failed: allRuns.filter(r => r.status === "failed").length,
+            active: allRuns.filter(r => r.status === "active").length,
+            runs: allRuns.map(r => ({
+              runId: r.runId,
+              task: r.taskDescription.slice(0, 60),
+              status: r.status,
+              phase: r.phase,
+            })),
+          };
+          return jsonResult(summary);
+        }
+
         let target: { runId: string; state: state.RunState } | null = null;
 
         if (requestedRunId) {
@@ -686,6 +721,17 @@ export function createHarnessStatusTool(runsDir: string): AnyAgentTool {
             blockerCount: latestCheckpoint.blockers.length,
             summary: latestCheckpoint.summary,
           };
+        }
+
+        // Include feature status if available
+        const features = state.readFeatures(runsDir, runId);
+        if (features.length > 0) {
+          const passed = features.filter(f => f.status === "passed").length;
+          const failed2 = features.filter(f => f.status === "failed").length;
+          const inProgress = features.filter(f => f.status === "in_progress").length;
+          const pending = features.filter(f => f.status === "pending").length;
+          const deferred = features.filter(f => f.status === "deferred").length;
+          result.featureStatus = { passed, failed: failed2, inProgress, pending, deferred, total: features.length };
         }
 
         const completed = state.listCompletedRuns(runsDir, 5);

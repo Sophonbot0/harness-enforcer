@@ -546,5 +546,44 @@ export default {
     api.logger.info(
       `[harness-enforcer] Plugin loaded. Stale timeout: ${STALE_RUN_TIMEOUT_MS / 60000}min, Timer interval: ${TIMER_UPDATE_INTERVAL_MS / 1000}s`,
     );
+
+    // ─── HOOK 3: session_start — bootstrap context for new sessions ───
+    api.on("session_start", async (_event, ctx) => {
+      const active = state.findActiveRun(runsDir);
+      if (!active) return;
+
+      const progressContent = state.readProgressFile(runsDir, active.runId);
+      const features = state.readFeatures(runsDir, active.runId);
+
+      if (!progressContent && features.length === 0) return;
+
+      const featureSummary = features.length > 0
+        ? `Features: ${features.filter(f => f.status === "passed").length}/${features.length} passed`
+        : "";
+
+      const bootstrapMsg = [
+        `📋 **Active Harness Run Detected**`,
+        `Task: ${active.state.taskDescription}`,
+        `Phase: ${active.state.phase}`,
+        `Run ID: ${active.runId}`,
+        featureSummary,
+        ``,
+        `Read the progress file and features.json before proceeding:`,
+        `- Progress: ~/.openclaw/harness-enforcer/runs/${active.runId}/progress.md`,
+        `- Features: ~/.openclaw/harness-enforcer/runs/${active.runId}/features.json`,
+        active.state.verifyCommand ? `- Verify command: ${active.state.verifyCommand}` : "",
+      ].filter(Boolean).join("\n");
+
+      api.logger.info(`[harness-enforcer] Session bootstrap: injecting run context for ${active.runId}`);
+
+      // Inject context as a system note (if the API supports it)
+      try {
+        if (ctx.injectSystemNote) {
+          await ctx.injectSystemNote(bootstrapMsg);
+        }
+      } catch {
+        // Not all session types support system note injection — that's fine
+      }
+    });
   },
 };

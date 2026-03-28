@@ -24,6 +24,7 @@ export interface Checkpoint {
   pendingFeatures: string[];
   blockers: string[];
   summary: string;
+  verificationLog?: string;
 }
 
 export interface Delivery {
@@ -368,6 +369,35 @@ export function listCompletedRuns(runsDir: string, limit: number = 5): Array<{ r
       if (state && state.status === "completed") {
         const delivery = readDelivery(runsDir, d);
         results.push({ runId: d, state, delivery });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return results;
+}
+
+/** List all runs with basic info, most recent first. */
+export function listAllRuns(runsDir: string): Array<{ runId: string; taskDescription: string; status: string; phase: string }> {
+  if (!fs.existsSync(runsDir)) return [];
+  const dirs = fs
+    .readdirSync(runsDir)
+    .filter((d) => {
+      try { return fs.statSync(path.join(runsDir, d)).isDirectory(); } catch { return false; }
+    })
+    .sort()
+    .reverse();
+  const results: Array<{ runId: string; taskDescription: string; status: string; phase: string }> = [];
+  for (const d of dirs) {
+    try {
+      const s = readRunState(runsDir, d);
+      if (s) {
+        results.push({
+          runId: d,
+          taskDescription: s.taskDescription,
+          status: s.status,
+          phase: s.phase,
+        });
       }
     } catch {
       continue;
