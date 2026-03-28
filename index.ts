@@ -317,6 +317,18 @@ export default {
       return null;
     }
 
+    /** Alert cooldown — prevent spam by only sending one alert per type per cooldown period */
+    const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes between alerts of same type
+    const lastAlertSentMs = new Map<string, number>();
+
+    function canSendAlert(alertType: string): boolean {
+      const now = Date.now();
+      const lastSent = lastAlertSentMs.get(alertType) ?? 0;
+      if (now - lastSent < ALERT_COOLDOWN_MS) return false;
+      lastAlertSentMs.set(alertType, now);
+      return true;
+    }
+
     /** Track file edits without tests (hallucination pattern v2) */
     const fileEditCounts = new Map<string, number>();
     let lastTestRunMs = 0;
@@ -445,29 +457,32 @@ export default {
         );
         if (hallucination) {
           api.logger.warn(`[harness-enforcer] ${hallucination}`);
-          // Send Telegram alert on hallucination
-          const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
-          try {
-            await api.runtime.channel.telegram.sendMessageTelegram(
-              alertChat,
-              `🔄 **Hallucination Loop Detected**\n${hallucination}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_The run continues but the agent may be stuck._`,
-              {},
-            );
-          } catch { /* best effort */ }
+          // Send Telegram alert ONCE per cooldown period (5 min)
+          if (canSendAlert("hallucination")) {
+            const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+            try {
+              await api.runtime.channel.telegram.sendMessageTelegram(
+                alertChat,
+                `🔄 **Hallucination Loop Detected**\n${hallucination}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_The run continues but the agent may be stuck._`,
+                {},
+              );
+            } catch { /* best effort */ }
+          }
         }
 
         const errorBurst = checkForErrorBurst();
         if (errorBurst) {
           api.logger.warn(`[harness-enforcer] ${errorBurst}`);
-          // Send Telegram alert on error burst
-          const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
-          try {
-            await api.runtime.channel.telegram.sendMessageTelegram(
-              alertChat,
-              `⚠️ **Watchdog Alert**\n${errorBurst}\nRun: ${activeForWatchdog.state.taskDescription}`,
-              {},
-            );
-          } catch { /* best effort */ }
+          if (canSendAlert("errorBurst")) {
+            const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+            try {
+              await api.runtime.channel.telegram.sendMessageTelegram(
+                alertChat,
+                `⚠️ **Watchdog Alert**\n${errorBurst}\nRun: ${activeForWatchdog.state.taskDescription}`,
+                {},
+              );
+            } catch { /* best effort */ }
+          }
         }
 
         // Check for file edit without test
@@ -480,15 +495,16 @@ export default {
         const stall = checkProgressStall(runsDir, activeForWatchdog.runId);
         if (stall) {
           api.logger.warn(`[harness-enforcer] ${stall}`);
-          // Send Telegram escalation on stall
-          const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
-          try {
-            await api.runtime.channel.telegram.sendMessageTelegram(
-              alertChat,
-              `⏸ **Progress Stalled**\n${stall}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_${PROGRESS_STALL_THRESHOLD} checkpoints with no new features completed._`,
+          if (canSendAlert("stall")) {
+            const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+            try {
+              await api.runtime.channel.telegram.sendMessageTelegram(
+                alertChat,
+                `⏸ **Progress Stalled**\n${stall}\nRun: ${activeForWatchdog.state.taskDescription}\n\n_${PROGRESS_STALL_THRESHOLD} checkpoints with no new features completed._`,
               {},
             );
           } catch { /* best effort */ }
+          }
         }
       }
 
