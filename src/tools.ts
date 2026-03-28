@@ -133,6 +133,19 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           dodItems.map((d) => ({ text: d.text, checked: d.checked })),
         );
 
+        // Register this run in the manifest if parentRunId matches a manifest
+        if (parentRunId) {
+          const manifest = state.readManifest(runsDir, parentRunId);
+          if (manifest) {
+            const matchingPlan = manifest.plans.find(p => p.path === planPath && p.status === "pending");
+            if (matchingPlan) {
+              matchingPlan.status = "active";
+              matchingPlan.runId = runId;
+              state.writeManifest(runsDir, manifest);
+            }
+          }
+        }
+
         // Write structured features (Anthropic pattern — immutable list)
         if (features.length > 0) {
           state.writeFeatures(runsDir, runId, features);
@@ -585,6 +598,60 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
               `Use parentRunId="${runId}" to link the runs.`;
           }
 
+          // Manifest-aware auto-chain — update manifest and find next plan
+          const manifest = state.findManifestByRunId(runsDir, runId);
+          if (manifest) {
+            // Mark this plan as completed in the manifest
+            const thisPlan = manifest.plans.find(p => p.runId === runId);
+            if (thisPlan) {
+              thisPlan.status = "completed";
+              thisPlan.evalGrade = evalGrade;
+              thisPlan.completedAt = new Date().toISOString();
+            }
+
+            // Check if all plans are done
+            const allDone = manifest.plans.every(p => p.status === "completed" || p.status === "skipped");
+            if (allDone) {
+              manifest.status = "completed";
+              state.writeManifest(runsDir, manifest);
+              res.manifestCompleted = true;
+              res.manifestId = manifest.manifestId;
+              res.manifestMessage = `🎉 All ${manifest.plans.length} phases completed! Project "${manifest.projectDescription}" is done.`;
+            } else {
+              // Find next plan(s)
+              const nextPlan = state.getNextPendingPlan(manifest);
+              const parallelReady = state.getParallelReadyPlans(manifest);
+
+              if (nextPlan && !rawNextPlan) {
+                // Auto-chain to next plan from manifest
+                manifest.currentPhase = nextPlan.phase;
+                state.writeManifest(runsDir, manifest);
+
+                res.nextPlanPath = nextPlan.path;
+                res.autoChain = true;
+                res.manifestId = manifest.manifestId;
+                res.manifestPhase = `${nextPlan.phase}/${manifest.plans.length}`;
+                res.chainingInstruction =
+                  `🔗 MANIFEST CHAIN: Phase ${nextPlan.phase}/${manifest.plans.length} — "${nextPlan.title}". ` +
+                  `Immediately call harness_start with planPath="${nextPlan.path}" ` +
+                  `and parentRunId="${manifest.manifestId}". Do NOT wait for user input. ` +
+                  `Carry forward telegramChatId and telegramThreadId.`;
+
+                if (parallelReady.length > 1) {
+                  res.parallelPlans = parallelReady.map(p => ({
+                    phase: p.phase,
+                    title: p.title,
+                    path: p.path,
+                  }));
+                  res.parallelHint = `${parallelReady.length} plans can run in parallel. ` +
+                    `Use sessions_spawn for each parallel plan if multi-agent is available.`;
+                }
+              } else {
+                state.writeManifest(runsDir, manifest);
+              }
+            }
+          }
+
           return res;
         });
 
@@ -1026,10 +1093,233 @@ export function createHarnessStatusTool(runsDir: string, sessionCtx: SessionCont
           }));
         }
 
+        // Show manifest progress if this run belongs to one
+        const manifest = state.findManifestByRunId(runsDir, runId)
+          ?? (runState.parentRunId ? state.readManifest(runsDir, runState.parentRunId) : null)
+          ?? state.findActiveManifest(runsDir);
+        if (manifest) {
+          const completedPlans = manifest.plans.filter(p => p.status === "completed").length;
+          const activePlans = manifest.plans.filter(p => p.status === "active").length;
+          const pendingPlans = manifest.plans.filter(p => p.status === "pending").length;
+          result.manifest = {
+            manifestId: manifest.manifestId,
+            project: manifest.projectDescription,
+            totalPhases: manifest.plans.length,
+            completedPhases: completedPlans,
+            activePhases: activePlans,
+            pendingPhases: pendingPlans,
+            currentPhase: manifest.currentPhase,
+            phases: manifest.plans.map(p => ({
+              phase: p.phase,
+              title: p.title,
+              status: p.status,
+              evalGrade: p.evalGrade,
+            })),
+          };
+        }
+
         return jsonResult(result);
       } catch (err) {
         return jsonResult({
           error: `harness_status failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    },
+  };
+}
+
+// ─── harness_plan ───
+
+export function createHarnessPlanTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
+  return {
+    name: "harness_plan",
+    description:
+      "Decompose a large project into N sequential plan files with a master manifest. " +
+      "Each plan gets a title, context, Definition of Done, estimated duration, and dependencies. " +
+      "The manifest tracks overall progress and enables auto-chaining between phases. " +
+      "Use this BEFORE harness_start when a project is too big for a single run.",
+    parameters: {
+      type: "object" as const,
+      properties: {
+        projectDescription: {
+          type: "string",
+          description: "High-level description of the full project to decompose.",
+        },
+        plans: {
+          type: "array",
+          description: "Array of plan objects, each with: title, dod (array of DoD strings), estimatedMinutes, dependsOn (array of phase numbers, empty for first), parallel (bool).",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              context: { type: "string", description: "Context and background for this phase." },
+              dod: { type: "array", items: { type: "string" }, description: "Definition of Done items (checkable)." },
+              estimatedMinutes: { type: "number" },
+              dependsOn: { type: "array", items: { type: "number" }, description: "Phase numbers this depends on (1-based). Empty array for independent." },
+              parallel: { type: "boolean", description: "Can this run in parallel with other plans at the same dependency level?" },
+            },
+            required: ["title", "dod"],
+          },
+        },
+        plansDir: {
+          type: "string",
+          description: "Directory to write plan files. Defaults to workspace/plans/<manifestId>/.",
+        },
+        autoStart: {
+          type: "boolean",
+          description: "If true, automatically trigger harness_start for the first plan.",
+        },
+      },
+      required: ["projectDescription", "plans"],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const p = params as Record<string, unknown>;
+        const projectDescription = p.projectDescription as string;
+        const planDefs = p.plans as Array<{
+          title: string;
+          context?: string;
+          dod: string[];
+          estimatedMinutes?: number;
+          dependsOn?: number[];
+          parallel?: boolean;
+        }>;
+        const customPlansDir = p.plansDir as string | undefined;
+        const autoStart = p.autoStart as boolean | undefined;
+
+        if (!projectDescription || !planDefs || planDefs.length === 0) {
+          return jsonResult({
+            error: "projectDescription and at least one plan are required.",
+          });
+        }
+
+        // Generate manifest ID
+        const manifestId = state.generateRunId();
+
+        // Determine plans directory
+        const workspaceDir = process.env.OPENCLAW_WORKSPACE
+          ?? `${process.env.HOME ?? "/tmp"}/.openclaw/workspace`;
+        const plansDir = customPlansDir
+          ?? `${workspaceDir}/plans/${manifestId}`;
+        state.ensureDir(plansDir);
+
+        // Generate plan files and manifest entries
+        const manifestPlans: state.ManifestPlan[] = [];
+
+        for (let i = 0; i < planDefs.length; i++) {
+          const def = planDefs[i];
+          const phase = i + 1;
+          const paddedPhase = String(phase).padStart(2, "0");
+          const filename = `phase-${paddedPhase}.md`;
+          const filePath = `${plansDir}/${filename}`;
+
+          // Build plan markdown
+          const lines: string[] = [
+            `# Phase ${phase}: ${def.title}`,
+            ``,
+          ];
+          if (def.context) {
+            lines.push(`## Context`);
+            lines.push(def.context);
+            lines.push(``);
+          }
+          if (phase > 1 || (def.dependsOn && def.dependsOn.length > 0)) {
+            const deps = def.dependsOn && def.dependsOn.length > 0
+              ? def.dependsOn.map(d => `Phase ${d}`).join(", ")
+              : `Phase ${phase - 1}`;
+            lines.push(`**Depends on:** ${deps}`);
+            lines.push(``);
+          }
+          if (def.estimatedMinutes) {
+            lines.push(`**Estimated:** ~${def.estimatedMinutes} minutes`);
+            lines.push(``);
+          }
+          lines.push(`## Definition of Done`);
+          lines.push(``);
+          for (const item of def.dod) {
+            lines.push(`- [ ] ${item}`);
+          }
+          lines.push(``);
+
+          fs.writeFileSync(filePath, lines.join("\n"));
+
+          manifestPlans.push({
+            phase,
+            title: def.title,
+            path: filePath,
+            dependsOn: def.dependsOn ?? (phase > 1 ? [phase - 1] : []),
+            parallel: def.parallel ?? false,
+            estimatedMinutes: def.estimatedMinutes,
+            status: "pending",
+          });
+        }
+
+        // Create and write manifest
+        const manifest: state.Manifest = {
+          manifestId,
+          projectDescription,
+          createdAt: new Date().toISOString(),
+          plansDir,
+          plans: manifestPlans,
+          currentPhase: 1,
+          status: "active",
+        };
+
+        state.writeManifest(runsDir, manifest);
+
+        // Write a summary manifest.md for human readability
+        const summaryLines = [
+          `# Project Manifest: ${projectDescription}`,
+          ``,
+          `**ID:** ${manifestId}`,
+          `**Created:** ${manifest.createdAt}`,
+          `**Phases:** ${manifestPlans.length}`,
+          ``,
+          `## Phase Overview`,
+          ``,
+          `| # | Title | Depends On | Parallel | Est. | Status |`,
+          `|---|---|---|---|---|---|`,
+        ];
+        for (const plan of manifestPlans) {
+          const deps = plan.dependsOn.length > 0 ? plan.dependsOn.join(", ") : "—";
+          const par = plan.parallel ? "✅" : "—";
+          const est = plan.estimatedMinutes ? `${plan.estimatedMinutes}m` : "—";
+          summaryLines.push(`| ${plan.phase} | ${plan.title} | ${deps} | ${par} | ${est} | ${plan.status} |`);
+        }
+        summaryLines.push(``);
+        fs.writeFileSync(`${plansDir}/manifest.md`, summaryLines.join("\n"));
+
+        const result: Record<string, unknown> = {
+          success: true,
+          manifestId,
+          plansDir,
+          planCount: manifestPlans.length,
+          plans: manifestPlans.map(p => ({
+            phase: p.phase,
+            title: p.title,
+            path: p.path,
+            dependsOn: p.dependsOn,
+            parallel: p.parallel,
+            estimatedMinutes: p.estimatedMinutes,
+          })),
+          firstPlanPath: manifestPlans[0]?.path,
+        };
+
+        // Auto-start first plan if requested
+        if (autoStart && manifestPlans.length > 0) {
+          result.autoStartHint =
+            `🚀 AUTO-START: Call harness_start now with planPath="${manifestPlans[0].path}" ` +
+            `and parentRunId="${manifestId}" to begin Phase 1.`;
+        } else {
+          result.hint =
+            `To begin, call harness_start with planPath="${manifestPlans[0]?.path}" ` +
+            `and parentRunId="${manifestId}".`;
+        }
+
+        return jsonResult(result);
+      } catch (err) {
+        return jsonResult({
+          error: `harness_plan failed: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
     },

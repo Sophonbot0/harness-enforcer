@@ -8,6 +8,7 @@ import {
   createHarnessStatusTool,
   createHarnessResetTool,
   createHarnessResumeTool,
+  createHarnessPlanTool,
 } from "./src/tools.js";
 import * as state from "./src/state.js";
 import { renderProgressBar, renderFinalStatus } from "./src/progress.js";
@@ -98,6 +99,7 @@ export default {
     api.registerTool(() => createHarnessStatusTool(runsDir, sessionContext));
     api.registerTool(() => createHarnessResetTool(runsDir, sessionContext));
     api.registerTool(() => createHarnessResumeTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessPlanTool(runsDir, sessionContext));
 
     // ─── Helpers ───
 

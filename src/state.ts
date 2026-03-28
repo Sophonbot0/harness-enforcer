@@ -50,6 +50,31 @@ export interface Delivery {
   checkpointCount: number;
 }
 
+/** A plan within a multi-phase manifest */
+export interface ManifestPlan {
+  phase: number;           // 1-based sequence number
+  title: string;
+  path: string;            // Absolute path to the plan .md file
+  dependsOn: number[];     // Phase numbers this plan depends on
+  parallel: boolean;       // Can run in parallel with other plans at same level
+  estimatedMinutes?: number;
+  status: "pending" | "active" | "completed" | "failed" | "skipped";
+  runId?: string;          // Harness run ID once started
+  evalGrade?: string;      // Grade once completed
+  completedAt?: string;
+}
+
+/** Master manifest for multi-phase project decomposition */
+export interface Manifest {
+  manifestId: string;
+  projectDescription: string;
+  createdAt: string;
+  plansDir: string;        // Directory containing the generated plan files
+  plans: ManifestPlan[];
+  currentPhase: number;    // Which phase is currently active/next
+  status: "active" | "completed" | "failed";
+}
+
 export interface DodItem {
   text: string;
   checked: boolean;
@@ -509,4 +534,77 @@ export function listAllRuns(runsDir: string): Array<{ runId: string; taskDescrip
     }
   }
   return results;
+}
+
+// ─── Manifest helpers ───
+
+export function getManifestsDir(runsDir: string): string {
+  return path.join(runsDir, "..", "manifests");
+}
+
+export function writeManifest(runsDir: string, manifest: Manifest): void {
+  const dir = getManifestsDir(runsDir);
+  ensureDir(dir);
+  const filePath = path.join(dir, `${manifest.manifestId}.json`);
+  fs.writeFileSync(filePath, JSON.stringify(manifest, null, 2));
+}
+
+export function readManifest(runsDir: string, manifestId: string): Manifest | null {
+  const filePath = path.join(getManifestsDir(runsDir), `${manifestId}.json`);
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+export function findManifestByRunId(runsDir: string, runId: string): Manifest | null {
+  const dir = getManifestsDir(runsDir);
+  if (!fs.existsSync(dir)) return null;
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const m: Manifest = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
+      if (m.plans.some(p => p.runId === runId)) return m;
+    } catch { continue; }
+  }
+  return null;
+}
+
+export function findActiveManifest(runsDir: string): Manifest | null {
+  const dir = getManifestsDir(runsDir);
+  if (!fs.existsSync(dir)) return null;
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const m: Manifest = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
+      if (m.status === "active") return m;
+    } catch { continue; }
+  }
+  return null;
+}
+
+export function getNextPendingPlan(manifest: Manifest): ManifestPlan | null {
+  for (const plan of manifest.plans) {
+    if (plan.status !== "pending") continue;
+    const depsOk = plan.dependsOn.every(dep => {
+      const depPlan = manifest.plans.find(p => p.phase === dep);
+      return depPlan && depPlan.status === "completed";
+    });
+    if (depsOk) return plan;
+  }
+  return null;
+}
+
+export function getParallelReadyPlans(manifest: Manifest): ManifestPlan[] {
+  const ready: ManifestPlan[] = [];
+  for (const plan of manifest.plans) {
+    if (plan.status !== "pending") continue;
+    const depsOk = plan.dependsOn.every(dep => {
+      const depPlan = manifest.plans.find(p => p.phase === dep);
+      return depPlan && depPlan.status === "completed";
+    });
+    if (depsOk) ready.push(plan);
+  }
+  return ready;
 }
