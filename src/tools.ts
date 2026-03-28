@@ -150,6 +150,8 @@ export function createHarnessStartTool(runsDir: string): AnyAgentTool {
 
         if (telegramChatId) {
           result.telegramAutoManaged = true;
+          result.telegramChatId = telegramChatId;
+          if (telegramThreadId) result.telegramThreadId = telegramThreadId;
           result.silentWorkMode = "⚠️ IMPORTANT: The plugin auto-sends and auto-edits the Telegram progress bar. Do NOT send or edit any Telegram messages yourself during this harness run. Just call harness_checkpoint to update progress — the bar updates automatically.";
         }
 
@@ -325,9 +327,12 @@ export function createHarnessCheckpointTool(runsDir: string): AnyAgentTool {
             res.featureStatus = { passed, pending: pending2, total: features.length };
           }
 
-          // Telegram is auto-managed by the plugin hook — no agent action needed
+          // Telegram is auto-managed by the plugin hook — pass IDs so it can send/edit
           if (runState.telegramChatId) {
             res.telegramAutoManaged = true;
+            res.telegramChatId = runState.telegramChatId;
+            if (runState.telegramMessageId) res.telegramMessageId = runState.telegramMessageId;
+            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
           }
 
           return res;
@@ -529,9 +534,12 @@ export function createHarnessSubmitTool(runsDir: string): AnyAgentTool {
             ...(warnings.length > 0 ? { warnings } : {}),
           };
 
-          // Telegram is auto-managed by the plugin hook — no agent action needed
+          // Telegram is auto-managed by the plugin hook — pass IDs so it can edit final bar
           if (runState.telegramChatId) {
             res.telegramAutoManaged = true;
+            res.telegramChatId = runState.telegramChatId;
+            if (runState.telegramMessageId) res.telegramMessageId = runState.telegramMessageId;
+            if (runState.telegramThreadId) res.telegramThreadId = runState.telegramThreadId;
           }
 
           // Run chaining — auto-continue to next plan
