@@ -185,7 +185,7 @@ export function extractFeatures(content: string): Feature[] {
     }
 
     // Match checkbox items
-    const checkboxMatch = trimmed.match(/^[-*]\s+\[([ xX])\]\s+(.*)/);
+    const checkboxMatch = trimmed.match(/^[-*]\s+\[([\sxX])\]\s+(.*)/);
     if (checkboxMatch) {
       const checked = checkboxMatch[1].toLowerCase() === "x";
       let description = checkboxMatch[2];
@@ -210,4 +210,134 @@ export function extractFeatures(content: string): Feature[] {
   }
 
   return features;
+}
+
+import type { ContractItem } from "./state.js";
+
+/**
+ * Extract contract items from a markdown plan.
+ * Supports two formats:
+ *
+ * Simple (from DoD checkboxes):
+ *   - [ ] Description of what to do
+ *
+ * Rich (with acceptance criteria and verify commands):
+ *   - [ ] **Feature Name**: Description
+ *     - AC: Acceptance criterion 1
+ *     - AC: Acceptance criterion 2
+ *     - VERIFY: shell command to run
+ *     - FILE: path/to/file/that/must/exist
+ *     - DEPENDS: c001, c002
+ *     - MAX_ATTEMPTS: 5
+ *
+ * If no rich syntax is found, DoD items become contract items with
+ * auto-generated acceptance criteria.
+ */
+export function extractContractItems(content: string): ContractItem[] {
+  const lines = content.split("\n");
+  const items: ContractItem[] = [];
+  let inCodeBlock = false;
+  let itemIndex = 0;
+  let currentItem: ContractItem | null = null;
+
+  function pushCurrentItem() {
+    if (currentItem) {
+      // Auto-generate acceptance criteria if none specified
+      if (currentItem.acceptanceCriteria.length === 0) {
+        currentItem.acceptanceCriteria.push(`"${currentItem.description}" is implemented and working`);
+      }
+      items.push(currentItem);
+    }
+  }
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) continue;
+
+    const trimmed = line.trim();
+
+    // Match top-level checkbox items (DoD items)
+    const checkboxMatch = trimmed.match(/^[-*]\s+\[([\sxX])\]\s+(.*)/);
+    if (checkboxMatch && !line.startsWith("    ") && !line.startsWith("\t\t")) {
+      // Save previous item
+      pushCurrentItem();
+
+      const checked = checkboxMatch[1].toLowerCase() === "x";
+      let description = checkboxMatch[2];
+
+      // Extract bold prefix
+      const boldMatch = description.match(/^\*\*([^*]+)\*\*[:\s]*(.*)/);
+      if (boldMatch) {
+        description = boldMatch[2] ? `${boldMatch[1]}: ${boldMatch[2]}`.trim() : boldMatch[1].trim();
+        if (description.endsWith(":")) description = description.slice(0, -1);
+      }
+
+      itemIndex++;
+      const id = `c${String(itemIndex).padStart(3, "0")}`;
+
+      currentItem = {
+        id,
+        description,
+        acceptanceCriteria: [],
+        status: checked ? "passed" : "pending",
+        attempts: 0,
+        maxAttempts: 3,
+      };
+      continue;
+    }
+
+    // Match sub-items (indented) under the current contract item
+    if (currentItem && /^\s{2,}[-*]\s/.test(line)) {
+      const subContent = trimmed.replace(/^[-*]\s+/, "");
+
+      // AC: Acceptance criterion
+      const acMatch = subContent.match(/^AC:\s*(.*)/i);
+      if (acMatch) {
+        currentItem.acceptanceCriteria.push(acMatch[1]);
+        continue;
+      }
+
+      // VERIFY: shell command
+      const verifyMatch = subContent.match(/^VERIFY:\s*(.*)/i);
+      if (verifyMatch) {
+        currentItem.verifyCommand = verifyMatch[1];
+        continue;
+      }
+
+      // FILE: required file path
+      const fileMatch = subContent.match(/^FILE:\s*(.*)/i);
+      if (fileMatch) {
+        if (!currentItem.verifyFileExists) currentItem.verifyFileExists = [];
+        currentItem.verifyFileExists.push(fileMatch[1].trim());
+        continue;
+      }
+
+      // DEPENDS: comma-separated item IDs
+      const depsMatch = subContent.match(/^DEPENDS:\s*(.*)/i);
+      if (depsMatch) {
+        currentItem.dependsOn = depsMatch[1].split(",").map(d => d.trim());
+        continue;
+      }
+
+      // MAX_ATTEMPTS: number
+      const maxMatch = subContent.match(/^MAX_ATTEMPTS:\s*(\d+)/i);
+      if (maxMatch) {
+        currentItem.maxAttempts = parseInt(maxMatch[1], 10);
+        continue;
+      }
+
+      // Plain sub-item = acceptance criterion
+      if (subContent.length > 0) {
+        currentItem.acceptanceCriteria.push(subContent);
+      }
+    }
+  }
+
+  // Don't forget the last item
+  pushCurrentItem();
+
+  return items;
 }

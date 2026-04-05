@@ -36,7 +36,9 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
     name: "harness_start",
     label: "Harness Start",
     description:
-      "Initialise a new harness run. Creates a run directory, records the plan, and extracts DoD items. " +
+      "Initialise a new harness run. Creates a run directory, records the plan, extracts DoD items, and generates a Contract Document. " +
+      "The Contract Document is the single source of truth: each DoD item becomes a contract item with acceptance criteria, " +
+      "verify commands, and retry limits. The agent works through items one-by-one; each is auto-verified on checkpoint. " +
       "Call this at the start of every harness pipeline. Only one active run is allowed at a time. " +
       "SILENT WORK MODE: During a harness run, do NOT send separate progress messages. " +
       "Do NOT send any text messages to the chat. Do NOT use the message tool. " +
@@ -84,10 +86,24 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           "planPath",
         );
         const taskDescription = validation.readStringParam(p, "taskDescription");
+        const telegramChatId = validation.readOptionalStringParam(p, "telegramChatId");
+        const telegramThreadId = validation.readOptionalStringParam(p, "telegramThreadId");
+        const verifyCommand = validation.readOptionalStringParam(p, "verifyCommand");
+        const parentRunId = validation.readOptionalStringParam(p, "parentRunId");
+        const isSubagent = p.isSubagent as boolean | undefined;
 
         // Check for already-active run ON THIS SESSION (allows concurrent runs on different sessions)
         const sessionKey = sessionCtx.currentSessionKey;
-        const active = state.findActiveRunForSession(runsDir, sessionKey);
+        // When Telegram params are explicitly provided, derive session key from them
+        // (more reliable than ctx.sessionKey which may come from cron/subagent context)
+        const effectiveSessionKey = 
+          (telegramChatId && telegramThreadId 
+            ? `agent:main:telegram:group:${telegramChatId}:topic:${telegramThreadId}`
+            : telegramChatId 
+              ? `agent:main:telegram:direct:${telegramChatId}`
+              : null)
+          || sessionKey;
+        const active = state.findActiveRunForSession(runsDir, effectiveSessionKey);
         if (active) {
           return jsonResult({
             error: "A harness run is already active for this session.",
@@ -112,12 +128,6 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
         const runId = state.generateRunId();
         const now = new Date().toISOString();
 
-        const telegramChatId = validation.readOptionalStringParam(p, "telegramChatId");
-        const telegramThreadId = validation.readOptionalStringParam(p, "telegramThreadId");
-        const verifyCommand = validation.readOptionalStringParam(p, "verifyCommand");
-        const parentRunId = validation.readOptionalStringParam(p, "parentRunId");
-        const isSubagent = p.isSubagent as boolean | undefined;
-
         const runState: state.RunState = {
           runId,
           planPath,
@@ -127,7 +137,7 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           round: 1,
           checkpoints: [],
           status: "active",
-          ...(sessionKey ? { sessionKey } : {}),
+          ...(effectiveSessionKey ? { sessionKey: effectiveSessionKey } : {}),
           ...(telegramChatId ? { telegramChatId } : {}),
           ...(telegramThreadId ? { telegramThreadId } : {}),
           ...(verifyCommand ? { verifyCommand } : {}),
@@ -160,6 +170,38 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           state.writeFeatures(runsDir, runId, features);
         }
 
+        // Generate contract document from plan
+        const contractItems = validation.extractContractItems(planContent);
+        if (contractItems.length > 0) {
+          // Apply global verifyCommand to items without their own
+          if (verifyCommand) {
+            for (const item of contractItems) {
+              if (!item.verifyCommand) {
+                item.verifyCommand = verifyCommand;
+              }
+            }
+          }
+          state.writeContract(runsDir, runId, contractItems);
+
+          // Write human-readable contract.md
+          const contractMd = state.renderContractMarkdown(contractItems, taskDescription);
+          const runDir = state.getRunDir(runsDir, runId);
+          fs.writeFileSync(`${runDir}/contract.md`, contractMd);
+        }
+
+        // Load cross-run learning for context
+        const globalLearning = state.readGlobalLearning(runsDir);
+        const relevantLessons = globalLearning
+          .filter(l => l.outcome === "failure")
+          .slice(-10)
+          .map(l => `⚠️ [${l.itemId}] ${l.lesson}`);
+
+        // Detect project working directory from plan path
+        const planDir = planPath.substring(0, planPath.lastIndexOf("/"));
+        const projectDir = planDir.includes("/plans/") ? planDir.split("/plans/")[0] : planDir;
+        runState.workingDirectory = projectDir;
+        state.writeRunState(runsDir, runId, runState);
+
         // Auto-render initial progress bar
         const progressBar = renderProgressBar({
           taskDescription,
@@ -181,8 +223,53 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           dodItemCount: dodItems.length,
           uncheckedDodItems: dodItems.filter((d) => !d.checked).length,
           featureCount: features.length,
+          contractItemCount: contractItems.length,
           progressBar,
         };
+
+        // Contract-driven workflow: tell agent what to do first
+        if (contractItems.length > 0) {
+          const firstItem = state.getNextContractItem(contractItems);
+          if (firstItem) {
+            result.contractMode = true;
+            result.nextItem = {
+              id: firstItem.id,
+              description: firstItem.description,
+              acceptanceCriteria: firstItem.acceptanceCriteria,
+              verifyCommand: firstItem.verifyCommand,
+              verifyFileExists: firstItem.verifyFileExists,
+            };
+            result.contractInstruction =
+              `\ud83d\udcdd CONTRACT MODE: Work through items one-by-one.\n` +
+              `\ud83d\udd34 CURRENT ITEM: [${firstItem.id}] ${firstItem.description}\n` +
+              `\ud83c\udfaf Acceptance criteria:\n${firstItem.acceptanceCriteria.map(ac => `  - ${ac}`).join("\n")}\n` +
+              (firstItem.verifyCommand ? `\ud83e\uddea Verify: ${firstItem.verifyCommand}\n` : "") +
+              (firstItem.verifyFileExists ? `\ud83d\udcc1 Required files: ${firstItem.verifyFileExists.join(", ")}\n` : "") +
+              `\n\u2705 When done, call harness_checkpoint with completedFeatures=["${firstItem.description}"].\n` +
+              `The system will auto-verify and advance to the next item.\n` +
+              `\n\ud83d\udca1 AUTONOMY RULES:\n` +
+              `- If stuck on an item for >3 attempts, use harness_modify to skip it and continue\n` +
+              `- If you discover the plan is wrong, use harness_modify to add/split/skip items\n` +
+              `- If you hit an error you don't understand, search the web before retrying\n` +
+              `- Checkpoint frequently (every major change) — the system enforces this\n` +
+              `- Git snapshots are taken before each item for safe rollback`;
+
+            // Check for parallel items
+            const parallelItems = state.getParallelContractItems(contractItems);
+            if (parallelItems.length > 1) {
+              result.parallelItems = parallelItems.map(i => ({ id: i.id, description: i.description }));
+              result.parallelHint =
+                `\ud83d\udd00 ${parallelItems.length} items can run in parallel: ${parallelItems.map(i => i.id).join(", ")}. ` +
+                `Consider spawning subagents for the others.`;
+            }
+          }
+        }
+
+        // Include learning from past runs
+        if (relevantLessons.length > 0) {
+          result.learningFromPastRuns = relevantLessons;
+          result.learningHint = `\ud83d\udcda Past failures to avoid:\n${relevantLessons.join("\n")}`;
+        }
 
         if (telegramChatId) {
           result.telegramAutoManaged = true;
@@ -218,7 +305,10 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
     label: "Harness Checkpoint",
     description:
       "Save progress during a harness run. Records the current phase, completed/pending features, " +
-      "blockers, and a summary. Data persists to disk and survives context compaction.",
+      "blockers, and a summary. Data persists to disk and survives context compaction. " +
+      "In CONTRACT MODE: when you mark a feature as completed, the system auto-verifies it against " +
+      "the Contract Document (runs verify commands, checks file existence). If verification fails, " +
+      "it returns retry instructions. If it passes, it advances to the next contract item.",
     parameters: {
       type: "object",
       properties: {
@@ -343,6 +433,7 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
           runState.phase = phase;
           const now = new Date().toISOString();
           runState.checkpoints.push(now);
+          runState.lastCheckpointAt = now;  // Track for forced checkpoint detection
           state.writeRunState(runsDir, runId, runState);
 
           const checkpoint: state.Checkpoint = {
@@ -371,6 +462,180 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
             completedFeatures,
             pendingFeatures,
           );
+
+          // ─── Contract verification: auto-verify completed items ───
+          const contract = state.readContract(runsDir, runId);
+          const contractVerification: Array<{ id: string; description: string; result: "passed" | "failed"; evidence?: string; error?: string }> = [];
+          let nextContractItem: state.ContractItem | null = null;
+
+          if (contract.length > 0) {
+            // Match completed features to contract items
+            for (const featureName of completedFeatures) {
+              const featureLower = featureName.toLowerCase();
+              // Find matching contract item
+              const item = contract.find(c =>
+                c.status !== "passed" && c.status !== "skipped" && (
+                  c.description.toLowerCase() === featureLower ||
+                  c.description.toLowerCase().includes(featureLower.slice(0, 30)) ||
+                  featureLower.includes(c.description.toLowerCase().slice(0, 30))
+                )
+              );
+              if (!item) continue;
+
+              // Mark as in_progress if first attempt
+              if (item.status === "pending") {
+                item.status = "in_progress";
+                item.startedAt = item.startedAt ?? new Date().toISOString();
+              }
+              item.attempts += 1;
+
+              let verified = true;
+              const evidenceParts: string[] = [];
+
+              // 1. Check required files exist
+              if (item.verifyFileExists && item.verifyFileExists.length > 0) {
+                for (const filePath of item.verifyFileExists) {
+                  if (fs.existsSync(filePath)) {
+                    evidenceParts.push(`✅ File exists: ${filePath}`);
+                  } else {
+                    verified = false;
+                    evidenceParts.push(`❌ File missing: ${filePath}`);
+                  }
+                }
+              }
+
+              // 2. Run verify command if specified
+              if (item.verifyCommand && verified) {
+                try {
+                  const { execSync } = require("node:child_process");
+                  const output = execSync(item.verifyCommand, {
+                    timeout: 60_000,
+                    encoding: "utf-8" as const,
+                    stdio: ["pipe", "pipe", "pipe"] as const,
+                  });
+                  evidenceParts.push(`✅ Verify passed: ${item.verifyCommand}`);
+                  evidenceParts.push(String(output).slice(-300));
+                } catch (verifyErr: unknown) {
+                  verified = false;
+                  const errMsg = verifyErr instanceof Error
+                    ? (verifyErr as { stderr?: string }).stderr ?? verifyErr.message
+                    : String(verifyErr);
+                  evidenceParts.push(`❌ Verify failed: ${String(errMsg).slice(-300)}`);
+                }
+              }
+
+              if (verified) {
+                item.status = "passed";
+                item.completedAt = new Date().toISOString();
+                item.evidence = evidenceParts.join("\n").slice(0, 1000);
+                contractVerification.push({
+                  id: item.id,
+                  description: item.description,
+                  result: "passed",
+                  evidence: item.evidence,
+                });
+
+                // Learning: record success
+                const itemDuration = item.startedAt
+                  ? Math.round((Date.now() - new Date(item.startedAt).getTime()) / 1000)
+                  : undefined;
+                state.appendLearning(runsDir, runId, {
+                  timestamp: new Date().toISOString(),
+                  itemId: item.id,
+                  description: item.description,
+                  approach: contextSnapshot?.currentApproach ?? "direct implementation",
+                  outcome: "success",
+                  lesson: `Completed in ${item.attempts} attempt(s)${itemDuration ? ` (${Math.round(itemDuration / 60)}min)` : ""}`,
+                  durationSeconds: itemDuration,
+                });
+              } else {
+                item.status = "failed";
+                item.failureLog = evidenceParts.join("\n").slice(0, 1000);
+                contractVerification.push({
+                  id: item.id,
+                  description: item.description,
+                  result: "failed",
+                  error: item.failureLog,
+                });
+
+                // Learning: record failure
+                state.appendLearning(runsDir, runId, {
+                  timestamp: new Date().toISOString(),
+                  itemId: item.id,
+                  description: item.description,
+                  approach: contextSnapshot?.currentApproach ?? "unknown",
+                  outcome: "failure",
+                  lesson: `Attempt ${item.attempts}/${item.maxAttempts} failed: ${item.failureLog?.slice(0, 200) ?? "unknown"}`,
+                });
+
+                // Self-healing: if max attempts exhausted, auto-skip if possible
+                if (item.attempts >= item.maxAttempts) {
+                  const canSkip = contract.some(c =>
+                    c.id !== item.id &&
+                    c.status === "pending" &&
+                    (!c.dependsOn || !c.dependsOn.includes(item.id))
+                  );
+                  if (canSkip) {
+                    item.status = "skipped";
+                    item.skipReason = `Auto-skipped after ${item.maxAttempts} failed attempts. Will revisit.`;
+                    state.appendLearning(runsDir, runId, {
+                      timestamp: new Date().toISOString(),
+                      itemId: item.id,
+                      description: item.description,
+                      approach: "auto-skip",
+                      outcome: "failure",
+                      lesson: `Exhausted ${item.maxAttempts} attempts. Auto-skipped to unblock progress.`,
+                    });
+                  }
+                }
+
+                // Git rollback hint if available
+                if (item.gitTag && runState.workingDirectory) {
+                  evidenceParts.push(`Git rollback: git checkout ${item.gitTag} in ${runState.workingDirectory}`);
+                }
+              }
+            }
+
+            // Git snapshot before next item
+            const nextForSnapshot = state.getNextContractItem(contract);
+            if (nextForSnapshot && runState.workingDirectory) {
+              try {
+                const { execSync } = require("node:child_process");
+                try {
+                  execSync(`git rev-parse --git-dir`, {
+                    cwd: runState.workingDirectory,
+                    timeout: 5_000,
+                    stdio: ["pipe", "pipe", "pipe"],
+                  });
+                  const commitHash = execSync(`git rev-parse HEAD`, {
+                    cwd: runState.workingDirectory,
+                    timeout: 5_000,
+                    encoding: "utf-8",
+                    stdio: ["pipe", "pipe", "pipe"],
+                  }).trim();
+                  nextForSnapshot.gitTag = commitHash;
+                } catch {
+                  // Not a git repo — skip snapshot
+                }
+              } catch {
+                // Git not available
+              }
+            }
+
+            // Save updated contract
+            state.writeContract(runsDir, runId, contract);
+
+            // Track current item for timeout detection
+            const nextActionable = state.getNextContractItem(contract);
+            if (nextActionable) {
+              runState.currentContractItemId = nextActionable.id;
+              runState.currentItemStartedAt = new Date().toISOString();
+              state.writeRunState(runsDir, runId, runState);
+            }
+
+            // Find next item to work on
+            nextContractItem = nextActionable;
+          }
 
           // Write progress file (cross-session memory)
           const features = state.readFeatures(runsDir, runId);
@@ -426,6 +691,89 @@ export function createHarnessCheckpointTool(runsDir: string, sessionCtx: Session
             const passed = features.filter(f => f.status === "passed").length;
             const pending2 = features.filter(f => f.status === "pending").length;
             res.featureStatus = { passed, pending: pending2, total: features.length };
+          }
+
+          // Contract verification results + next item instruction
+          if (contractVerification.length > 0) {
+            res.contractVerification = contractVerification;
+
+            const failed = contractVerification.filter(v => v.result === "failed");
+            const passed2 = contractVerification.filter(v => v.result === "passed");
+
+            if (failed.length > 0) {
+              // Item(s) failed verification — instruct agent to retry or self-heal
+              const failedItem = failed[0];
+              const contractItem = contract.find(c => c.id === failedItem.id);
+              const remaining = contractItem ? contractItem.maxAttempts - contractItem.attempts : 0;
+
+              if (remaining > 0) {
+                // Still has retries — try to fix
+                res.contractInstruction =
+                  `\u274c CONTRACT ITEM [${failedItem.id}] FAILED VERIFICATION\n` +
+                  `Description: ${failedItem.description}\n` +
+                  `Error: ${failedItem.error?.slice(0, 300) ?? "Unknown"}\n` +
+                  `Attempts: ${contractItem?.attempts ?? "?"}/${contractItem?.maxAttempts ?? 3} (${remaining} remaining)\n` +
+                  `\n\ud83d\udd27 FIX the issue and call harness_checkpoint again with this item in completedFeatures.\n` +
+                  `\ud83d\udca1 If stuck, try:\n` +
+                  `  1. Search the web for the error message\n` +
+                  `  2. Try a different approach (use harness_modify to update acceptance criteria)\n` +
+                  `  3. If truly blocked, call harness_modify action=skip to skip and continue`;
+              } else if (contractItem?.status === "skipped") {
+                // Auto-skipped — moved to next item
+                res.contractInstruction =
+                  `\u23ed\ufe0f ITEM [${failedItem.id}] AUTO-SKIPPED (exhausted ${contractItem.maxAttempts} attempts)\n` +
+                  `Reason: ${contractItem.skipReason ?? "max retries"}\n` +
+                  `Continuing with next available item...\n` +
+                  (nextContractItem ? `\ud83d\udd34 NEXT: [${nextContractItem.id}] ${nextContractItem.description}` : "No more items.");
+              } else {
+                // Exhausted and can't skip (dependencies block)
+                res.contractInstruction =
+                  `\ud83d\uded1 ITEM [${failedItem.id}] BLOCKED \u2014 ${contractItem?.attempts}/${contractItem?.maxAttempts} attempts failed\n` +
+                  `Other items depend on this one. Cannot auto-skip.\n` +
+                  `\ud83d\udea8 ESCALATION: Alert the user or try a fundamentally different approach.\n` +
+                  `Consider: harness_modify action=split to break this into smaller sub-tasks.`;
+                res.escalationNeeded = true;
+              }
+            } else if (passed2.length > 0 && nextContractItem) {
+              // Item(s) passed, advance to next
+              const contractStats = contract.length > 0 ? {
+                total: contract.length,
+                passed: contract.filter(c => c.status === "passed").length,
+                failed: contract.filter(c => c.status === "failed").length,
+                pending: contract.filter(c => c.status === "pending").length,
+              } : undefined;
+
+              res.contractProgress = contractStats;
+              res.contractInstruction =
+                `\u2705 Item(s) verified! Progress: ${contractStats?.passed}/${contractStats?.total}\n` +
+                `\n\ud83d\udd34 NEXT ITEM: [${nextContractItem.id}] ${nextContractItem.description}\n` +
+                `\ud83c\udfaf Acceptance criteria:\n${nextContractItem.acceptanceCriteria.map(ac => `  - ${ac}`).join("\n")}\n` +
+                (nextContractItem.verifyCommand ? `\ud83e\uddea Verify: ${nextContractItem.verifyCommand}\n` : "") +
+                (nextContractItem.verifyFileExists ? `\ud83d\udcc1 Required files: ${nextContractItem.verifyFileExists.join(", ")}\n` : "") +
+                `\nImplement this item and call harness_checkpoint with completedFeatures=["${nextContractItem.description}"].`;
+
+              // Check for parallel items
+              const parallelItems = state.getParallelContractItems(contract);
+              if (parallelItems.length > 1) {
+                res.parallelItems = parallelItems.map(i => ({ id: i.id, description: i.description }));
+                res.parallelHint =
+                  `\ud83d\udd00 ${parallelItems.length} items can run in parallel: ${parallelItems.map(i => i.id).join(", ")}. ` +
+                  `Spawn subagents for the others if possible.`;
+              }
+            } else if (passed2.length > 0 && !nextContractItem) {
+              // All items done!
+              res.contractComplete = true;
+              res.contractInstruction =
+                `\ud83c\udf89 ALL CONTRACT ITEMS COMPLETE! (${contract.filter(c => c.status === "passed").length}/${contract.length})\n` +
+                `Write the eval report and call harness_submit.`;
+            }
+          } else if (contract.length > 0 && nextContractItem) {
+            // No verification happened but contract exists — show next item
+            res.contractInstruction =
+              `\ud83d\udd34 NEXT ITEM: [${nextContractItem.id}] ${nextContractItem.description}\n` +
+              `\ud83c\udfaf Acceptance criteria:\n${nextContractItem.acceptanceCriteria.map(ac => `  - ${ac}`).join("\n")}\n` +
+              (nextContractItem.verifyCommand ? `\ud83e\uddea Verify: ${nextContractItem.verifyCommand}\n` : "") +
+              `\nImplement and call harness_checkpoint with completedFeatures=["${nextContractItem.description}"].`;
           }
 
           // Telegram is auto-managed by the plugin hook — pass IDs so it can send/edit
@@ -533,6 +881,29 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
 
         const { runId, state: runState } = active;
         const errors: string[] = [];
+        const warnings: string[] = [];
+
+        // 0. Auto-run verify command if set
+        if (runState.verifyCommand) {
+          try {
+            const { execSync } = await import("node:child_process");
+            const verifyOutput = execSync(runState.verifyCommand, {
+              timeout: 120_000,
+              encoding: "utf-8",
+              stdio: ["pipe", "pipe", "pipe"],
+              env: { ...process.env, CI: "true" },
+            });
+            // Check for test failures in output
+            const hasFailure = /fail|error|FAIL|ERROR|\u2717|\u2718|FAILED/i.test(verifyOutput)
+              && !/0 fail/i.test(verifyOutput) && !/0 error/i.test(verifyOutput);
+            if (hasFailure) {
+              errors.push(`Verify command failed:\n${verifyOutput.slice(-500)}`);
+            }
+          } catch (verifyErr) {
+            const msg = verifyErr instanceof Error ? (verifyErr as { stderr?: string }).stderr ?? verifyErr.message : String(verifyErr);
+            errors.push(`Verify command '${runState.verifyCommand}' failed:\n${String(msg).slice(-500)}`);
+          }
+        }
 
         // 1. Check eval report
         let evalContent: string | null = null;
@@ -560,6 +931,27 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
           }
         }
 
+        // 2b. Check contract items (all must be passed)
+        const contractItems = state.readContract(runsDir, runId);
+        if (contractItems.length > 0) {
+          const notPassed = contractItems.filter(c => c.status !== "passed" && c.status !== "skipped");
+          if (notPassed.length > 0) {
+            errors.push(
+              `${notPassed.length} contract item(s) not completed:\n` +
+                notPassed.map(c => `  [❌ ${c.id}] ${c.description} (status: ${c.status}, attempts: ${c.attempts}/${c.maxAttempts})`).join("\n"),
+            );
+          }
+
+          // Check for items that exhausted retries
+          const exhausted = contractItems.filter(c => c.status === "failed" && c.attempts >= c.maxAttempts);
+          if (exhausted.length > 0) {
+            warnings.push(
+              `${exhausted.length} contract item(s) exhausted max attempts:\n` +
+                exhausted.map(c => `  [${c.id}] ${c.description} — ${c.failureLog?.slice(0, 100) ?? "no log"}`).join("\n"),
+            );
+          }
+        }
+
         // 3. Check challenge report if provided
         if (challengeReportPath) {
           const challengeContent = validation.safeReadFile(challengeReportPath);
@@ -577,7 +969,6 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
         }
 
         // 4. Check feature verification (warn, not block)
-        const warnings: string[] = [];
         const features = state.readFeatures(runsDir, runId);
         if (features.length > 0) {
           const unverified = features.filter(f => f.status === "passed" && !f.verifiedAt);
@@ -590,6 +981,7 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
         }
 
         if (errors.length > 0) {
+          const MAX_ROUNDS = 3;
           // Generate recovery hints based on what failed
           const hints: string[] = [];
           for (const err of errors) {
@@ -604,12 +996,75 @@ export function createHarnessSubmitTool(runsDir: string, sessionCtx: SessionCont
             }
           }
 
+          // Iterative loop: increment round, return to build phase
+          if (runState.round < MAX_ROUNDS) {
+            runState.round += 1;
+            runState.phase = "build";
+            state.writeRunState(runsDir, runId, runState);
+
+            // Append iteration checkpoint
+            const iterCheckpoint: state.Checkpoint = {
+              timestamp: new Date().toISOString(),
+              phase: "iteration",
+              completedFeatures: [],
+              pendingFeatures: errors.map(e => e.slice(0, 100)),
+              blockers: errors.slice(0, 3),
+              summary: `Round ${runState.round - 1} failed eval. Iterating (round ${runState.round}/${MAX_ROUNDS}).`,
+            };
+            state.appendCheckpoint(runsDir, runId, iterCheckpoint);
+
+            const dodItems = state.readDodItems(runsDir, runId);
+            const lastCp = state.readCheckpoints(runsDir, runId);
+            const prevCp = lastCp.length > 1 ? lastCp[lastCp.length - 2] : null;
+            const elapsed2 = elapsedSeconds(runState.startedAt);
+            const progressBar = renderProgressBar({
+              taskDescription: runState.taskDescription,
+              phase: `iteration ${runState.round}/${MAX_ROUNDS}`,
+              completedFeatures: prevCp?.completedFeatures ?? [],
+              pendingFeatures: prevCp?.pendingFeatures ?? [],
+              blockers: errors.slice(0, 3),
+              dodTotal: dodItems.length,
+              dodCompleted: prevCp?.completedFeatures.length ?? 0,
+              elapsedSeconds: elapsed2,
+              workLog: [`⚠️ Round ${runState.round - 1} failed — iterating`],
+            });
+
+            const iterResult: Record<string, unknown> = {
+              delivered: false,
+              iteration_needed: true,
+              runId,
+              round: runState.round,
+              maxRounds: MAX_ROUNDS,
+              errors,
+              recoveryHints: hints,
+              progressBar,
+              instruction:
+                `🔄 ITERATION ${runState.round}/${MAX_ROUNDS}: Eval failed. Fix the issues below and call harness_submit again.\n` +
+                `Do NOT start a new run. Stay in the current run and fix:\n` +
+                errors.map((e, i) => `${i + 1}. ${e}`).join("\n") + "\n" +
+                hints.join("\n"),
+            };
+            if (runState.telegramChatId) {
+              iterResult.telegramAutoManaged = true;
+              iterResult.telegramChatId = runState.telegramChatId;
+              if (runState.telegramMessageId) iterResult.telegramMessageId = runState.telegramMessageId;
+              if (runState.telegramThreadId) iterResult.telegramThreadId = runState.telegramThreadId;
+            }
+            return jsonResult(iterResult);
+          }
+
+          // Max rounds reached — hard fail
+          runState.status = "failed";
+          state.writeRunState(runsDir, runId, runState);
+
           return jsonResult({
             delivered: false,
             runId,
+            failed: true,
+            round: runState.round,
             errors,
             recoveryHints: hints,
-            hint: "Fix all issues above and call harness_submit again.",
+            hint: `Max iterations (${MAX_ROUNDS}) reached. Run failed. Use harness_reset to start fresh.`,
           });
         }
 
@@ -895,7 +1350,7 @@ export function createHarnessResumeTool(runsDir: string, sessionCtx: SessionCont
           const s = state.readRunState(runsDir, requestedRunId);
           if (s) sourceRun = { runId: requestedRunId, state: s };
         } else {
-          sourceRun = state.findMostRecentRun(runsDir);
+          sourceRun = state.findMostRecentRun(runsDir, sessionCtx.currentSessionKey);
         }
 
         if (!sourceRun) {
@@ -960,6 +1415,11 @@ export function createHarnessResumeTool(runsDir: string, sessionCtx: SessionCont
         }
         if (sourceFeatures.length > 0) {
           state.writeFeatures(runsDir, newRunId, sourceFeatures);
+        }
+        // Carry over contract
+        const sourceContract = state.readContract(runsDir, sourceRun.runId);
+        if (sourceContract.length > 0) {
+          state.writeContract(runsDir, newRunId, sourceContract);
         }
 
         // Build resume briefing for the agent
@@ -1122,7 +1582,7 @@ export function createHarnessStatusTool(runsDir: string, sessionCtx: SessionCont
           const s = state.readRunState(runsDir, requestedRunId);
           if (s) target = { runId: requestedRunId, state: s };
         } else {
-          target = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey) ?? state.findMostRecentRun(runsDir);
+          target = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey) ?? state.findMostRecentRun(runsDir, sessionCtx.currentSessionKey);
         }
 
         if (!target) {
@@ -1182,7 +1642,32 @@ export function createHarnessStatusTool(runsDir: string, sessionCtx: SessionCont
           result.featureStatus = { passed, failed: failed2, inProgress, pending, deferred, total: features.length };
         }
 
-        const completed = state.listCompletedRuns(runsDir, 5);
+        // Include contract status if available
+        const contractItems = state.readContract(runsDir, runId);
+        if (contractItems.length > 0) {
+          const cPassed = contractItems.filter(c => c.status === "passed").length;
+          const cFailed = contractItems.filter(c => c.status === "failed").length;
+          const cPending = contractItems.filter(c => c.status === "pending").length;
+          const cInProgress = contractItems.filter(c => c.status === "in_progress").length;
+          const nextItem = state.getNextContractItem(contractItems);
+          result.contractStatus = {
+            passed: cPassed,
+            failed: cFailed,
+            pending: cPending,
+            inProgress: cInProgress,
+            total: contractItems.length,
+            nextItem: nextItem ? { id: nextItem.id, description: nextItem.description } : null,
+            items: contractItems.map(c => ({
+              id: c.id,
+              description: c.description.slice(0, 60),
+              status: c.status,
+              attempts: c.attempts,
+              maxAttempts: c.maxAttempts,
+            })),
+          };
+        }
+
+        const completed = state.listCompletedRuns(runsDir, 5, sessionCtx.currentSessionKey);
         if (completed.length > 0) {
           result.recentCompleted = completed.map((c) => ({
             runId: c.runId,
@@ -1420,6 +1905,368 @@ export function createHarnessPlanTool(runsDir: string, sessionCtx: SessionContex
       } catch (err) {
         return jsonResult({
           error: `harness_plan failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    },
+  };
+}
+
+// ─── harness_challenge ───
+
+export function createHarnessChallengeTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
+  return {
+    name: "harness_challenge",
+    label: "Harness Challenge",
+    description:
+      "Run automated quality checks on the current harness run. " +
+      "Validates modified files exist, runs verify command, checks for common issues. " +
+      "Returns structured findings (CRITICAL/WARNING/INFO) that must be addressed before submit.",
+    parameters: {
+      type: "object",
+      properties: {
+        checks: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional specific checks to run: 'files', 'verify', 'syntax', 'all'. Default: 'all'.",
+        },
+      },
+      required: [],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const p = params as Record<string, unknown>;
+        const checks = (p.checks as string[] | undefined) ?? ["all"];
+        const runAll = checks.includes("all");
+
+        const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
+        if (!active) {
+          return jsonResult({
+            error: "No active harness run found.",
+            hint: "Call harness_start first.",
+          });
+        }
+
+        const { runId, state: runState } = active;
+        const findings: Array<{ level: "CRITICAL" | "WARNING" | "INFO"; check: string; message: string }> = [];
+
+        // 1. File existence check
+        if (runAll || checks.includes("files")) {
+          const snapshot = runState.lastContextSnapshot;
+          if (snapshot?.filesModified) {
+            for (const f of snapshot.filesModified) {
+              if (!fs.existsSync(f)) {
+                findings.push({ level: "CRITICAL", check: "files", message: `Modified file missing: ${f}` });
+              }
+            }
+            if (snapshot.filesModified.length === 0) {
+              findings.push({ level: "WARNING", check: "files", message: "No files recorded as modified." });
+            }
+          } else {
+            findings.push({ level: "WARNING", check: "files", message: "No contextSnapshot.filesModified recorded." });
+          }
+        }
+
+        // 2. Verify command
+        if ((runAll || checks.includes("verify")) && runState.verifyCommand) {
+          try {
+            const { execSync } = await import("node:child_process");
+            execSync(runState.verifyCommand, {
+              timeout: 120_000,
+              encoding: "utf-8",
+              stdio: ["pipe", "pipe", "pipe"],
+              env: { ...process.env, CI: "true" },
+            });
+            findings.push({ level: "INFO", check: "verify", message: `Verify passed: ${runState.verifyCommand}` });
+          } catch (err) {
+            const msg = err instanceof Error ? (err as { stderr?: string }).stderr ?? err.message : String(err);
+            findings.push({ level: "CRITICAL", check: "verify", message: `Verify failed: ${String(msg).slice(-300)}` });
+          }
+        }
+
+        // 3. DoD progress
+        if (runAll) {
+          const checkpoints = state.readCheckpoints(runsDir, runId);
+          const lastCp = checkpoints.length > 0 ? checkpoints[checkpoints.length - 1] : null;
+          const dodItems = state.readDodItems(runsDir, runId);
+          if (lastCp) {
+            const completed = lastCp.completedFeatures.length;
+            const total = dodItems.length || (completed + lastCp.pendingFeatures.length);
+            if (completed < total) {
+              findings.push({
+                level: "WARNING",
+                check: "progress",
+                message: `${completed}/${total} features done. Pending: ${lastCp.pendingFeatures.slice(0, 3).join(", ")}`,
+              });
+            }
+            if (lastCp.blockers.length > 0) {
+              findings.push({ level: "CRITICAL", check: "blockers", message: `Unresolved blockers: ${lastCp.blockers.join(", ")}` });
+            }
+          }
+        }
+
+        // 4. Plan file + unchecked DoD
+        if (runAll) {
+          const planContent = validation.safeReadFile(runState.planPath);
+          if (!planContent) {
+            findings.push({ level: "CRITICAL", check: "plan", message: `Plan missing: ${runState.planPath}` });
+          } else {
+            const unchecked = validation.findUncheckedDod(planContent);
+            if (unchecked.length > 0) {
+              findings.push({ level: "WARNING", check: "dod", message: `${unchecked.length} unchecked DoD items` });
+            }
+          }
+        }
+
+        // 5. Contract validation
+        if (runAll) {
+          const contractItems = state.readContract(runsDir, runId);
+          if (contractItems.length > 0) {
+            const notPassed = contractItems.filter(c => c.status !== "passed" && c.status !== "skipped");
+            if (notPassed.length > 0) {
+              findings.push({
+                level: "CRITICAL",
+                check: "contract",
+                message: `${notPassed.length}/${contractItems.length} contract items not completed: ` +
+                  notPassed.map(c => `[${c.id}] ${c.description.slice(0, 40)}`).join(", "),
+              });
+            }
+            const exhausted = contractItems.filter(c => c.status === "failed" && c.attempts >= c.maxAttempts);
+            if (exhausted.length > 0) {
+              findings.push({
+                level: "CRITICAL",
+                check: "contract",
+                message: `${exhausted.length} item(s) exhausted max retries: ` +
+                  exhausted.map(c => `[${c.id}] ${c.description.slice(0, 40)}`).join(", "),
+              });
+            }
+            const passed3 = contractItems.filter(c => c.status === "passed").length;
+            findings.push({
+              level: "INFO",
+              check: "contract",
+              message: `Contract progress: ${passed3}/${contractItems.length} items passed`,
+            });
+          }
+        }
+
+        const criticals = findings.filter(f => f.level === "CRITICAL").length;
+        const warningCount = findings.filter(f => f.level === "WARNING").length;
+
+        runState.phase = "challenge";
+        state.writeRunState(runsDir, runId, runState);
+
+        return jsonResult({
+          success: true,
+          runId,
+          round: runState.round,
+          findings,
+          summary: { critical: criticals, warning: warningCount, info: findings.length - criticals - warningCount, total: findings.length },
+          canSubmit: criticals === 0,
+          instruction: criticals > 0
+            ? `\ud83d\uded1 ${criticals} CRITICAL issue(s) found. Fix before harness_submit.`
+            : warningCount > 0
+              ? `\u26a0\ufe0f ${warningCount} warning(s). May proceed to harness_submit.`
+              : "\u2705 All checks passed. Ready for harness_submit.",
+        });
+      } catch (err) {
+        return jsonResult({
+          error: `harness_challenge failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    },
+  };
+}
+
+// ─── harness_modify ───
+
+export function createHarnessModifyTool(runsDir: string, sessionCtx: SessionContext): AnyAgentTool {
+  return {
+    name: "harness_modify",
+    label: "Harness Modify",
+    description:
+      "Dynamic re-planning: modify the contract during a run. " +
+      "Actions: 'add' new items, 'skip' items with reason, 'split' items into sub-tasks, " +
+      "'update' acceptance criteria. Use when the plan is wrong or incomplete.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "Action to perform: 'add', 'skip', 'split', 'update'.",
+        },
+        itemId: {
+          type: "string",
+          description: "Contract item ID to modify (for skip/split/update).",
+        },
+        reason: {
+          type: "string",
+          description: "Reason for the modification.",
+        },
+        description: {
+          type: "string",
+          description: "Description for new item (add action).",
+        },
+        acceptanceCriteria: {
+          type: "array",
+          items: { type: "string" },
+          description: "Acceptance criteria for new/updated item.",
+        },
+        verifyCommand: {
+          type: "string",
+          description: "Verify command for new/updated item.",
+        },
+        subItems: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              description: { type: "string" },
+              acceptanceCriteria: { type: "array", items: { type: "string" } },
+              verifyCommand: { type: "string" },
+            },
+            required: ["description"],
+          },
+          description: "Sub-items for split action.",
+        },
+      },
+      required: ["action"],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const p = params as Record<string, unknown>;
+        const action = validation.readStringParam(p, "action");
+        const itemId = validation.readOptionalStringParam(p, "itemId");
+        const reason = validation.readOptionalStringParam(p, "reason");
+
+        const active = state.findActiveRunForSession(runsDir, sessionCtx.currentSessionKey);
+        if (!active) {
+          return jsonResult({
+            error: "No active harness run found.",
+            hint: "Call harness_start first.",
+          });
+        }
+
+        const { runId, state: runState } = active;
+        const contract = state.readContract(runsDir, runId);
+
+        if (action === "add") {
+          const description = validation.readStringParam(p, "description");
+          const acceptanceCriteria = (p.acceptanceCriteria as string[] | undefined) ?? [`"${description}" is implemented and working`];
+          const verifyCommand = validation.readOptionalStringParam(p, "verifyCommand") ?? runState.verifyCommand;
+
+          const existingIds = contract.map(c => parseInt(c.id.replace("c", ""), 10)).filter(n => !isNaN(n));
+          const nextNum = (Math.max(0, ...existingIds) + 1);
+          const newId = `c${String(nextNum).padStart(3, "0")}`;
+
+          const newItem: state.ContractItem = {
+            id: newId,
+            description,
+            acceptanceCriteria,
+            verifyCommand,
+            status: "pending",
+            attempts: 0,
+            maxAttempts: 3,
+          };
+
+          state.addContractItem(runsDir, runId, newItem);
+
+          state.appendLearning(runsDir, runId, {
+            timestamp: new Date().toISOString(),
+            itemId: newId,
+            description,
+            approach: "dynamic-add",
+            outcome: "success",
+            lesson: `Added mid-run: ${reason ?? "plan adjustment"}`,
+          });
+
+          return jsonResult({
+            success: true,
+            action: "add",
+            newItem: { id: newId, description, acceptanceCriteria },
+            contractSize: contract.length + 1,
+            instruction: `Added [${newId}] "${description}". Continue with current work.`,
+          });
+        }
+
+        if (action === "skip") {
+          if (!itemId) return jsonResult({ error: "itemId required for skip action." });
+          const skipReason = reason ?? "Skipped by agent during execution";
+          const skipped = state.skipContractItem(runsDir, runId, itemId, skipReason);
+          if (!skipped) return jsonResult({ error: `Item ${itemId} not found.` });
+
+          state.appendLearning(runsDir, runId, {
+            timestamp: new Date().toISOString(),
+            itemId,
+            description: skipped.description,
+            approach: "manual-skip",
+            outcome: "failure",
+            lesson: `Skipped: ${skipReason}`,
+          });
+
+          const nextItem = state.getNextContractItem(state.readContract(runsDir, runId));
+          return jsonResult({
+            success: true,
+            action: "skip",
+            skippedItem: { id: itemId, description: skipped.description, reason: skipReason },
+            nextItem: nextItem ? { id: nextItem.id, description: nextItem.description } : null,
+            instruction: nextItem
+              ? `Skipped [${itemId}]. Next: [${nextItem.id}] ${nextItem.description}`
+              : `Skipped [${itemId}]. No more items — ready for harness_submit.`,
+          });
+        }
+
+        if (action === "split") {
+          if (!itemId) return jsonResult({ error: "itemId required for split action." });
+          const subItems = p.subItems as Array<{ description: string; acceptanceCriteria?: string[]; verifyCommand?: string }> | undefined;
+          if (!subItems || subItems.length === 0) {
+            return jsonResult({ error: "subItems array required for split action (at least 1 sub-item)." });
+          }
+
+          const newItems = state.splitContractItem(runsDir, runId, itemId, subItems);
+          if (newItems.length === 0) return jsonResult({ error: `Item ${itemId} not found.` });
+
+          state.appendLearning(runsDir, runId, {
+            timestamp: new Date().toISOString(),
+            itemId,
+            description: `Split into ${newItems.length} sub-items`,
+            approach: "dynamic-split",
+            outcome: "success",
+            lesson: `Item was too complex. Split into: ${newItems.map(i => i.id).join(", ")}`,
+          });
+
+          const nextItem = state.getNextContractItem(state.readContract(runsDir, runId));
+          return jsonResult({
+            success: true,
+            action: "split",
+            originalItem: itemId,
+            newItems: newItems.map(i => ({ id: i.id, description: i.description })),
+            nextItem: nextItem ? { id: nextItem.id, description: nextItem.description } : null,
+            instruction: `Split [${itemId}] into ${newItems.length} sub-items. ` +
+              (nextItem ? `Next: [${nextItem.id}] ${nextItem.description}` : "Ready for submit."),
+          });
+        }
+
+        if (action === "update") {
+          if (!itemId) return jsonResult({ error: "itemId required for update action." });
+          const updates: Partial<Omit<state.ContractItem, "id">> = {};
+          if (p.acceptanceCriteria) updates.acceptanceCriteria = p.acceptanceCriteria as string[];
+          if (p.verifyCommand !== undefined) updates.verifyCommand = p.verifyCommand as string;
+          if (p.description) updates.description = p.description as string;
+
+          const updated = state.updateContractItem(runsDir, runId, itemId, updates);
+          if (!updated) return jsonResult({ error: `Item ${itemId} not found.` });
+
+          return jsonResult({
+            success: true,
+            action: "update",
+            updatedItem: { id: itemId, description: updated.description },
+            instruction: `Updated [${itemId}]. Continue working on it.`,
+          });
+        }
+
+        return jsonResult({ error: `Unknown action: ${action}. Use: add, skip, split, update.` });
+      } catch (err) {
+        return jsonResult({
+          error: `harness_modify failed: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
     },

@@ -21,6 +21,13 @@ export interface RunState {
   isSubagent?: boolean;  // Running inside a subagent — shorter stale timeout
   resumedFrom?: string;  // If this run was resumed from a cancelled/stale run
   lastContextSnapshot?: ContextSnapshot;  // Latest context snapshot for recovery
+  // ─── Autonomy enhancements ───
+  lastCheckpointAt?: string;       // ISO timestamp of last checkpoint (for forced checkpoint detection)
+  currentContractItemId?: string;  // Which contract item the agent is working on
+  currentItemStartedAt?: string;   // When the current item started (for per-item timeout)
+  gitSnapshotBranch?: string;      // Branch used for per-item git snapshots
+  workingDirectory?: string;       // Project working directory for git operations
+  learningLog?: LearningEntry[];   // What worked / what didn't
 }
 
 export interface Checkpoint {
@@ -41,6 +48,17 @@ export interface ContextSnapshot {
   currentApproach?: string;      // What strategy is being used
   blockerHistory?: string[];     // Blockers that were resolved (for learning)
   nextSteps?: string[];          // What should happen next (for resume)
+}
+
+/** Learning entry — records what worked and what didn't across items */
+export interface LearningEntry {
+  timestamp: string;
+  itemId: string;
+  description: string;
+  approach: string;
+  outcome: "success" | "failure";
+  lesson: string;               // What we learned
+  durationSeconds?: number;
 }
 
 export interface Delivery {
@@ -88,6 +106,28 @@ export interface Feature {
   status: "pending" | "in_progress" | "passed" | "failed" | "deferred";
   verifiedAt?: string;
   verifiedBy?: string;  // "test" | "build" | "manual" | "lint"
+}
+
+/** Contract item — single source of truth for each deliverable */
+export interface ContractItem {
+  id: string;                    // e.g. "c001"
+  description: string;           // What to build/do
+  acceptanceCriteria: string[];   // How to verify it's done (human-readable)
+  verifyCommand?: string;         // Optional shell command to verify (exit 0 = pass)
+  verifyFileExists?: string[];    // Optional files that must exist when done
+  status: "pending" | "in_progress" | "passed" | "failed" | "skipped";
+  attempts: number;               // How many times we tried
+  maxAttempts: number;            // Max retries (default 3)
+  evidence?: string;              // Output/proof of completion (last 1000 chars)
+  failureLog?: string;            // Why it failed last time
+  startedAt?: string;
+  completedAt?: string;
+  dependsOn?: string[];           // IDs of contract items this depends on
+  skipReason?: string;            // Why this item was skipped
+  gitTag?: string;                // Git tag/commit before this item started (for rollback)
+  timeoutMinutes?: number;        // Per-item timeout (default 30)
+  alternativeApproaches?: string[]; // Approaches to try if primary fails
+  parallelGroup?: string;         // Items with same group can run in parallel
 }
 
 // ─── Concurrency Lock (MEDIUM 3) ───
@@ -208,6 +248,105 @@ export function readFeatures(runsDir: string, runId: string): Feature[] {
   if (!fs.existsSync(p)) return [];
   const content = fs.readFileSync(p, "utf-8");
   return safeParseJson<Feature[]>(content, p);
+}
+
+// ─── Contract Document ───
+
+export function writeContract(runsDir: string, runId: string, items: ContractItem[]): void {
+  const dir = getRunDir(runsDir, runId);
+  ensureDir(dir);
+  safeWriteFile(path.join(dir, "contract.json"), JSON.stringify(items, null, 2));
+}
+
+export function readContract(runsDir: string, runId: string): ContractItem[] {
+  const p = path.join(getRunDir(runsDir, runId), "contract.json");
+  if (!fs.existsSync(p)) return [];
+  const content = fs.readFileSync(p, "utf-8");
+  return safeParseJson<ContractItem[]>(content, p);
+}
+
+/** Get the next actionable contract item (respects dependencies). */
+export function getNextContractItem(items: ContractItem[]): ContractItem | null {
+  for (const item of items) {
+    if (item.status !== "pending" && item.status !== "failed") continue;
+    if (item.status === "failed" && item.attempts >= item.maxAttempts) continue;
+    // Check dependencies are satisfied
+    if (item.dependsOn && item.dependsOn.length > 0) {
+      const depsOk = item.dependsOn.every(depId => {
+        const dep = items.find(i => i.id === depId);
+        return dep && dep.status === "passed";
+      });
+      if (!depsOk) continue;
+    }
+    return item;
+  }
+  return null;
+}
+
+/** Update a single contract item by ID. */
+export function updateContractItem(
+  runsDir: string,
+  runId: string,
+  itemId: string,
+  update: Partial<Omit<ContractItem, "id">>,
+): ContractItem | null {
+  const items = readContract(runsDir, runId);
+  const item = items.find(i => i.id === itemId);
+  if (!item) return null;
+  Object.assign(item, update);
+  writeContract(runsDir, runId, items);
+  return item;
+}
+
+/** Generate a contract.md document from contract items (human-readable). */
+export function renderContractMarkdown(items: ContractItem[], taskDescription: string): string {
+  const lines: string[] = [
+    `# Contract Document`,
+    ``,
+    `**Task:** ${taskDescription}`,
+    `**Generated:** ${new Date().toISOString()}`,
+    `**Total items:** ${items.length}`,
+    ``,
+    `| # | Status | Description | Attempts | Evidence |`,
+    `|---|--------|-------------|----------|----------|`,
+  ];
+  for (const item of items) {
+    const statusIcon = item.status === "passed" ? "✅"
+      : item.status === "failed" ? "❌"
+      : item.status === "in_progress" ? "⏳"
+      : item.status === "skipped" ? "⏭️"
+      : "⬜";
+    const evidence = item.evidence ? item.evidence.slice(0, 50) + "..." : "—";
+    lines.push(`| ${item.id} | ${statusIcon} ${item.status} | ${item.description.slice(0, 60)} | ${item.attempts}/${item.maxAttempts} | ${evidence} |`);
+  }
+  lines.push(``);
+
+  // Details for each item
+  for (const item of items) {
+    lines.push(`## ${item.id}: ${item.description}`);
+    lines.push(``);
+    if (item.acceptanceCriteria.length > 0) {
+      lines.push(`**Acceptance Criteria:**`);
+      for (const ac of item.acceptanceCriteria) {
+        lines.push(`- ${ac}`);
+      }
+    }
+    if (item.verifyCommand) {
+      lines.push(`**Verify:** \`${item.verifyCommand}\``);
+    }
+    if (item.verifyFileExists && item.verifyFileExists.length > 0) {
+      lines.push(`**Required files:** ${item.verifyFileExists.join(", ")}`);
+    }
+    if (item.evidence) {
+      lines.push(`**Evidence:** ${item.evidence.slice(0, 200)}`);
+    }
+    if (item.failureLog) {
+      lines.push(`**Last failure:** ${item.failureLog.slice(0, 200)}`);
+    }
+    lines.push(``);
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -461,8 +600,8 @@ export function findAllActiveRuns(runsDir: string): Array<{ runId: string; state
   return results;
 }
 
-/** Get the most recent run (any status). */
-export function findMostRecentRun(runsDir: string): { runId: string; state: RunState } | null {
+/** Get the most recent run (any status). Optionally scoped to a session. */
+export function findMostRecentRun(runsDir: string, sessionKey?: string): { runId: string; state: RunState } | null {
   if (!fs.existsSync(runsDir)) return null;
   const dirs = fs
     .readdirSync(runsDir)
@@ -471,19 +610,46 @@ export function findMostRecentRun(runsDir: string): { runId: string; state: RunS
     })
     .sort()
     .reverse();
+
+  // First pass: find most recent run for this session
+  if (sessionKey) {
+    for (const d of dirs) {
+      try {
+        const state = readRunState(runsDir, d);
+        if (state && state.sessionKey === sessionKey) return { runId: d, state };
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  // Second pass: find any unscoped run (legacy)
   for (const d of dirs) {
     try {
       const state = readRunState(runsDir, d);
-      if (state) return { runId: d, state };
+      if (state && !state.sessionKey) return { runId: d, state };
     } catch {
       continue;
     }
   }
+
+  // Last resort: return the most recent regardless (for explicit runId lookups in status)
+  if (!sessionKey) {
+    for (const d of dirs) {
+      try {
+        const state = readRunState(runsDir, d);
+        if (state) return { runId: d, state };
+      } catch {
+        continue;
+      }
+    }
+  }
+
   return null;
 }
 
 /** List completed runs, most recent first. */
-export function listCompletedRuns(runsDir: string, limit: number = 5): Array<{ runId: string; state: RunState; delivery: Delivery | null }> {
+export function listCompletedRuns(runsDir: string, limit: number = 5, sessionKey?: string): Array<{ runId: string; state: RunState; delivery: Delivery | null }> {
   if (!fs.existsSync(runsDir)) return [];
   const dirs = fs
     .readdirSync(runsDir)
@@ -498,6 +664,8 @@ export function listCompletedRuns(runsDir: string, limit: number = 5): Array<{ r
     try {
       const state = readRunState(runsDir, d);
       if (state && state.status === "completed") {
+        // Session scoping: only show runs from this session (or unscoped legacy runs)
+        if (sessionKey && state.sessionKey && state.sessionKey !== sessionKey) continue;
         const delivery = readDelivery(runsDir, d);
         results.push({ runId: d, state, delivery });
       }
@@ -608,4 +776,144 @@ export function getParallelReadyPlans(manifest: Manifest): ManifestPlan[] {
     if (depsOk) ready.push(plan);
   }
   return ready;
+}
+
+// ─── Learning Log ───
+
+export function appendLearning(runsDir: string, runId: string, entry: LearningEntry): void {
+  const dir = getRunDir(runsDir, runId);
+  ensureDir(dir);
+  safeAppendFile(path.join(dir, "learning.jsonl"), JSON.stringify(entry) + "\n");
+}
+
+export function readLearningLog(runsDir: string, runId: string): LearningEntry[] {
+  const p = path.join(getRunDir(runsDir, runId), "learning.jsonl");
+  if (!fs.existsSync(p)) return [];
+  const content = fs.readFileSync(p, "utf-8");
+  const lines = content.split("\n").filter(l => l.trim().length > 0);
+  const results: LearningEntry[] = [];
+  for (const line of lines) {
+    try { results.push(JSON.parse(line)); } catch { continue; }
+  }
+  return results;
+}
+
+/** Read learning from ALL past runs for cross-run knowledge. */
+export function readGlobalLearning(runsDir: string): LearningEntry[] {
+  if (!fs.existsSync(runsDir)) return [];
+  const entries: LearningEntry[] = [];
+  const dirs = fs.readdirSync(runsDir).filter(d => {
+    try { return fs.statSync(path.join(runsDir, d)).isDirectory(); } catch { return false; }
+  });
+  for (const d of dirs) {
+    const logPath = path.join(runsDir, d, "learning.jsonl");
+    if (!fs.existsSync(logPath)) continue;
+    try {
+      const content = fs.readFileSync(logPath, "utf-8");
+      for (const line of content.split("\n").filter(l => l.trim())) {
+        try { entries.push(JSON.parse(line)); } catch { continue; }
+      }
+    } catch { continue; }
+  }
+  return entries;
+}
+
+// ─── Dynamic Re-planning ───
+
+/** Add a new contract item mid-run. */
+export function addContractItem(runsDir: string, runId: string, item: ContractItem): void {
+  const items = readContract(runsDir, runId);
+  items.push(item);
+  writeContract(runsDir, runId, items);
+}
+
+/** Skip a contract item with reason. */
+export function skipContractItem(runsDir: string, runId: string, itemId: string, reason: string): ContractItem | null {
+  return updateContractItem(runsDir, runId, itemId, {
+    status: "skipped",
+    skipReason: reason,
+    completedAt: new Date().toISOString(),
+  });
+}
+
+/** Split a contract item into sub-items. Original becomes "skipped" with reference to children. */
+export function splitContractItem(
+  runsDir: string,
+  runId: string,
+  itemId: string,
+  subItems: Array<{ description: string; acceptanceCriteria?: string[]; verifyCommand?: string }>,
+): ContractItem[] {
+  const items = readContract(runsDir, runId);
+  const parent = items.find(i => i.id === itemId);
+  if (!parent) return [];
+
+  const newItems: ContractItem[] = [];
+  for (let i = 0; i < subItems.length; i++) {
+    const sub = subItems[i];
+    const newId = `${itemId}.${i + 1}`;
+    const newItem: ContractItem = {
+      id: newId,
+      description: sub.description,
+      acceptanceCriteria: sub.acceptanceCriteria ?? [`"${sub.description}" is implemented and working`],
+      verifyCommand: sub.verifyCommand ?? parent.verifyCommand,
+      status: "pending",
+      attempts: 0,
+      maxAttempts: parent.maxAttempts,
+      dependsOn: i > 0 ? [`${itemId}.${i}`] : parent.dependsOn,
+    };
+    newItems.push(newItem);
+  }
+
+  // Mark parent as skipped
+  parent.status = "skipped";
+  parent.skipReason = `Split into ${newItems.length} sub-items: ${newItems.map(i => i.id).join(", ")}`;
+
+  // Insert new items after the parent
+  const parentIndex = items.indexOf(parent);
+  items.splice(parentIndex + 1, 0, ...newItems);
+
+  // Update dependencies: anything that depended on parent now depends on the last sub-item
+  const lastSubId = newItems[newItems.length - 1].id;
+  for (const item of items) {
+    if (item.dependsOn?.includes(itemId) && item.id !== itemId) {
+      item.dependsOn = item.dependsOn.map(d => d === itemId ? lastSubId : d);
+    }
+  }
+
+  writeContract(runsDir, runId, items);
+  return newItems;
+}
+
+/** Get contract items that can run in parallel (same parallelGroup, all deps satisfied). */
+export function getParallelContractItems(items: ContractItem[]): ContractItem[] {
+  const actionable = items.filter(item => {
+    if (item.status !== "pending" && item.status !== "failed") return false;
+    if (item.status === "failed" && item.attempts >= item.maxAttempts) return false;
+    if (item.dependsOn && item.dependsOn.length > 0) {
+      return item.dependsOn.every(depId => {
+        const dep = items.find(i => i.id === depId);
+        return dep && (dep.status === "passed" || dep.status === "skipped");
+      });
+    }
+    return true;
+  });
+
+  // Group by parallelGroup
+  if (actionable.length <= 1) return actionable;
+  
+  // Items with same parallelGroup can run together
+  const grouped = actionable.filter(i => i.parallelGroup);
+  if (grouped.length > 1) {
+    const firstGroup = grouped[0].parallelGroup;
+    return grouped.filter(i => i.parallelGroup === firstGroup);
+  }
+  
+  // Items without explicit dependencies on each other can run in parallel
+  const independent = actionable.filter(item => {
+    return !actionable.some(other => 
+      other.id !== item.id && item.dependsOn?.includes(other.id)
+    );
+  });
+  
+  return independent.length > 1 ? independent : [actionable[0]].filter(Boolean);
 }

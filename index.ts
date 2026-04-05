@@ -9,6 +9,8 @@ import {
   createHarnessResetTool,
   createHarnessResumeTool,
   createHarnessPlanTool,
+  createHarnessChallengeTool,
+  createHarnessModifyTool,
 } from "./src/tools.js";
 import * as state from "./src/state.js";
 import { renderProgressBar, renderFinalStatus } from "./src/progress.js";
@@ -27,6 +29,10 @@ const HARNESS_TOOLS = new Set([
   "harness_submit",
   "harness_reset",
   "harness_resume",
+  "harness_status",
+  "harness_plan",
+  "harness_challenge",
+  "harness_modify",
 ]);
 
 // ─── Configuration ───
@@ -39,6 +45,9 @@ const TOOL_ERROR_WINDOW_MS = 5 * 60 * 1000; // 5min window for error accumulatio
 const TOOL_ERROR_THRESHOLD = 5; // 5 errors in window → escalate
 const PROGRESS_STALL_THRESHOLD = 3; // 3 checkpoints with same completed count → stalled
 const SAME_FILE_EDIT_THRESHOLD = 5; // Same file edited 5x without test → warn
+const FORCED_CHECKPOINT_INTERVAL_MS = 10 * 60 * 1000; // 10 min → force checkpoint reminder
+const ITEM_TIMEOUT_MS = 30 * 60 * 1000; // 30 min per contract item default
+const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000; // 15 min heartbeat with ETA
 
 // ─── State ───
 let lastTimerUpdateMs = 0;
@@ -102,6 +111,8 @@ export default {
     api.registerTool(() => createHarnessResetTool(runsDir, sessionContext));
     api.registerTool(() => createHarnessResumeTool(runsDir, sessionContext));
     api.registerTool(() => createHarnessPlanTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessChallengeTool(runsDir, sessionContext));
+    api.registerTool(() => createHarnessModifyTool(runsDir, sessionContext));
 
     // ─── Helpers ───
 
@@ -164,6 +175,9 @@ export default {
       runId: string,
     ): Promise<void> {
       try {
+        api.logger.info(
+          `[harness-enforcer] sendProgressBar: chatId=${chatId} threadId=${threadId ?? 'none'}`,
+        );
         const result = await api.runtime.channel.telegram.sendMessageTelegram(
           chatId,
           text,
@@ -171,11 +185,18 @@ export default {
             ...(threadId ? { messageThreadId: parseInt(threadId, 10) } : {}),
           },
         );
+        api.logger.debug(
+          `[harness-enforcer] sendProgressBar result: ${JSON.stringify(result)?.slice(0, 200)}`,
+        );
         if (result?.messageId) {
           runState.telegramMessageId = String(result.messageId);
           state.writeRunState(runsDir, runId, runState);
           api.logger.info(
             `[harness-enforcer] Progress bar sent: msgId=${result.messageId}`,
+          );
+        } else {
+          api.logger.warn(
+            `[harness-enforcer] sendProgressBar: no messageId in result`,
           );
         }
       } catch (err) {
@@ -205,6 +226,19 @@ export default {
         ? lastCheckpoint.completedFeatures.length
         : 0;
 
+      // Check for manifest sprint info
+      let sprintCurrent: number | undefined;
+      let sprintTotal: number | undefined;
+      const manifest = state.findManifestByRunId(runsDir, active.runId)
+        ?? (active.state.parentRunId ? state.readManifest(runsDir, active.state.parentRunId) : null);
+      if (manifest) {
+        const thisPlan = manifest.plans.find(p => p.runId === active.runId);
+        if (thisPlan) {
+          sprintCurrent = thisPlan.phase;
+          sprintTotal = manifest.plans.length;
+        }
+      }
+
       return renderProgressBar({
         taskDescription: active.state.taskDescription,
         phase: lastCheckpoint?.phase ?? active.state.phase,
@@ -219,6 +253,9 @@ export default {
             : 0),
         dodCompleted,
         elapsedSeconds,
+        sprintCurrent,
+        sprintTotal,
+        workLog: active.state.workLog,
       });
     }
 
@@ -444,15 +481,28 @@ export default {
       }
 
       // Silent work mode: intercept message sends during active harness runs
+      // Allow progress bar messages through (they contain harness progress patterns)
       if (toolEvent.toolName === "message") {
         const active = state.findActiveRunForSession(runsDir, ctx.sessionKey);
         if (active) {
-          return {
-            block: true,
-            blockReason:
-              `🔇 SILENT WORK MODE — Message blocked. During a harness run, do NOT send messages. ` +
-              `Use harness_checkpoint with currentAction instead. Work silently: read → edit → exec → checkpoint.`,
-          };
+          const msgText = (toolEvent.params as Record<string, unknown>)?.message as string | undefined;
+          const isProgressBar = msgText && (
+            msgText.startsWith("\u{1F527}") ||       // wrench emoji
+            msgText.includes("\u25b6plan") ||          // phase indicator
+            msgText.includes("\u2705 DELIVERED") ||    // delivered status
+            msgText.includes("done | ") ||             // progress pattern
+            msgText.includes("\u25b0\u25b0") ||        // filled progress bar
+            msgText.includes("\u25b1\u25b1")           // empty progress bar
+          );
+          if (!isProgressBar) {
+            return {
+              block: true,
+              blockReason:
+                `🔇 SILENT WORK MODE — Message blocked. During a harness run, do NOT send messages. ` +
+                `Use harness_checkpoint with currentAction instead. Work silently: read → edit → exec → checkpoint.`,
+            };
+          }
+          // Progress bar messages are allowed through
         }
       }
     });
@@ -561,6 +611,40 @@ export default {
           } catch { /* best effort */ }
           }
         }
+
+        // Forced checkpoint reminder: if no checkpoint for 10 min
+        const lastCpAt = activeForWatchdog.state.lastCheckpointAt
+          ? new Date(activeForWatchdog.state.lastCheckpointAt).getTime()
+          : new Date(activeForWatchdog.state.startedAt).getTime();
+        const sinceLastCp = Date.now() - lastCpAt;
+        if (sinceLastCp > FORCED_CHECKPOINT_INTERVAL_MS && canSendAlert("forced_checkpoint")) {
+          api.logger.warn(
+            `[harness-enforcer] No checkpoint for ${Math.round(sinceLastCp / 60000)}min. Injecting reminder.`,
+          );
+        }
+
+        // Item timeout: if current contract item started >30 min ago
+        if (activeForWatchdog.state.currentItemStartedAt && activeForWatchdog.state.currentContractItemId) {
+          const itemStarted = new Date(activeForWatchdog.state.currentItemStartedAt).getTime();
+          const contract = state.readContract(runsDir, activeForWatchdog.runId);
+          const currentItem = contract.find(c => c.id === activeForWatchdog.state.currentContractItemId);
+          const itemTimeout = (currentItem?.timeoutMinutes ?? 30) * 60 * 1000;
+          const sinceItemStart = Date.now() - itemStarted;
+
+          if (sinceItemStart > itemTimeout && canSendAlert(`item_timeout_${activeForWatchdog.state.currentContractItemId}`)) {
+            const alertChat = activeForWatchdog.state.telegramChatId ?? "193902961";
+            const itemDesc = currentItem?.description ?? activeForWatchdog.state.currentContractItemId;
+            try {
+              await api.runtime.channel.telegram.sendMessageTelegram(
+                alertChat,
+                `\u23f0 **Item Timeout**\n[${activeForWatchdog.state.currentContractItemId}] ${itemDesc}\n` +
+                `Stuck for ${Math.round(sinceItemStart / 60000)} min (limit: ${Math.round(itemTimeout / 60000)} min)\n` +
+                `Consider: skip, split, or try a different approach.`,
+                {},
+              );
+            } catch { /* best effort */ }
+          }
+        }
       }
 
       // ── For harness_* tools: immediate progress bar send/edit ──
@@ -626,6 +710,10 @@ export default {
 
         const progressBar = payload.progressBar as string;
 
+        api.logger.debug(
+          `[harness-enforcer] Progress bar: tool=${event.toolName} chatId=${payload.telegramChatId ?? 'none'}`,
+        );
+
         let chatId = payload.telegramChatId as string | undefined;
         let threadId = payload.telegramThreadId as string | undefined;
 
@@ -665,8 +753,15 @@ export default {
         // Resolve which messageId to use: payload > runState > none
         const resolvedMsgId = messageId ?? runState?.telegramMessageId;
 
+        api.logger.debug(
+          `[harness-enforcer] Progress bar resolve: msgId=${resolvedMsgId ?? 'null'} hasState=${!!runState}`,
+        );
+
         if (!resolvedMsgId) {
           // No existing message — send a new one
+          api.logger.debug(
+            `[harness-enforcer] Sending new progress bar: chatId=${chatId} runId=${resolvedRunId ?? 'none'}`,
+          );
           if (runState && resolvedRunId) {
             await sendProgressBar(
               chatId,
@@ -683,9 +778,16 @@ export default {
             progressBar,
           );
           if (!ok && runState && resolvedRunId) {
-            // Message was deleted — clear the ID so next call sends a new one
+            // Message was deleted — clear ID and send a NEW message
             runState.telegramMessageId = undefined;
             state.writeRunState(runsDir, resolvedRunId, runState);
+            await sendProgressBar(
+              chatId,
+              threadId,
+              progressBar,
+              runState,
+              resolvedRunId,
+            );
           }
         }
 
@@ -711,8 +813,17 @@ export default {
         progressBar,
       );
       if (!ok) {
+        // Message deleted — send new one
         activeForTimer.state.telegramMessageId = undefined;
         state.writeRunState(runsDir, activeForTimer.runId, activeForTimer.state);
+        const threadId2 = activeForTimer.state.telegramThreadId;
+        await sendProgressBar(
+          activeForTimer.state.telegramChatId,
+          threadId2,
+          progressBar,
+          activeForTimer.state,
+          activeForTimer.runId,
+        );
       }
 
       lastTimerUpdateMs = now;
@@ -789,6 +900,83 @@ export default {
       }
     }, TIMER_UPDATE_INTERVAL_MS);
 
+    // ─── HEARTBEAT TIMER: periodic status with ETA (every 15 min) ───
+    let lastHeartbeatMs = 0;
+    const heartbeatInterval = setInterval(async () => {
+      try {
+        const now = Date.now();
+        if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
+
+        const activeRuns = state.findAllActiveRuns(runsDir);
+        if (activeRuns.length === 0) return;
+
+        for (const active of activeRuns) {
+          if (!active.state.telegramChatId) continue;
+
+          const elapsed = Math.round((now - new Date(active.state.startedAt).getTime()) / 1000);
+          const contract = state.readContract(runsDir, active.runId);
+          const checkpoints = state.readCheckpoints(runsDir, active.runId);
+
+          // Calculate ETA based on average item completion time
+          let eta = "unknown";
+          if (contract.length > 0) {
+            const passed = contract.filter(c => c.status === "passed").length;
+            const remaining = contract.filter(c => c.status === "pending" || c.status === "in_progress").length;
+            if (passed > 0) {
+              const avgSecondsPerItem = elapsed / passed;
+              const etaSeconds = avgSecondsPerItem * remaining;
+              const etaMin = Math.round(etaSeconds / 60);
+              eta = etaMin > 60 ? `~${Math.round(etaMin / 60)}h ${etaMin % 60}m` : `~${etaMin}m`;
+            }
+          }
+
+          const contractSummary = contract.length > 0
+            ? `Contract: ${contract.filter(c => c.status === "passed").length}/${contract.length} items`
+            : `Checkpoints: ${checkpoints.length}`;
+
+          const currentItem = active.state.currentContractItemId
+            ? contract.find(c => c.id === active.state.currentContractItemId)
+            : null;
+
+          const heartbeatMsg =
+            `\ud83d\udc93 **Heartbeat** \u2014 ${Math.round(elapsed / 60)}min elapsed\n` +
+            `Task: ${active.state.taskDescription.slice(0, 60)}\n` +
+            `${contractSummary} | ETA: ${eta}\n` +
+            (currentItem ? `Working on: [${currentItem.id}] ${currentItem.description.slice(0, 50)}` : "");
+
+          // Only send heartbeat if there's been no checkpoint recently
+          const lastCpTime = active.state.lastCheckpointAt
+            ? new Date(active.state.lastCheckpointAt).getTime()
+            : new Date(active.state.startedAt).getTime();
+          const sinceLastCp = now - lastCpTime;
+
+          // Send heartbeat only if no checkpoint in last 15 min (avoids spam when active)
+          if (sinceLastCp > HEARTBEAT_INTERVAL_MS) {
+            const threadId = active.state.telegramThreadId;
+            try {
+              await api.runtime.channel.telegram.sendMessageTelegram(
+                active.state.telegramChatId,
+                heartbeatMsg,
+                {
+                  ...(threadId ? { messageThreadId: parseInt(threadId, 10) } : {}),
+                },
+              );
+            } catch { /* best effort */ }
+          }
+        }
+
+        lastHeartbeatMs = now;
+      } catch (err) {
+        api.logger.debug(
+          `[harness-enforcer] Heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+
+    if (typeof heartbeatInterval === "object" && heartbeatInterval && "unref" in heartbeatInterval) {
+      (heartbeatInterval as NodeJS.Timeout).unref();
+    }
+
     // Prevent the interval from keeping the process alive
     if (typeof timerInterval === "object" && timerInterval && "unref" in timerInterval) {
       (timerInterval as NodeJS.Timeout).unref();
@@ -817,6 +1005,15 @@ export default {
         ? `Features: ${features.filter(f => f.status === "passed").length}/${features.length} passed`
         : "";
 
+      // Load contract for recovery
+      const contractItems = state.readContract(runsDir, active.runId);
+      const contractSummary = contractItems.length > 0
+        ? `Contract: ${contractItems.filter(c => c.status === "passed").length}/${contractItems.length} items passed`
+        : "";
+      const nextContractItem = contractItems.length > 0
+        ? state.getNextContractItem(contractItems)
+        : null;
+
       // Build comprehensive recovery context
       const bootstrapParts: string[] = [
         `📋 **Active Harness Run Detected — Auto-Recovery**`,
@@ -825,6 +1022,7 @@ export default {
         `Run ID: ${active.runId}`,
         `Round: ${active.state.round}`,
         featureSummary,
+        contractSummary,
         ``,
       ];
 
@@ -874,6 +1072,17 @@ export default {
 
       if (active.state.resumedFrom) {
         bootstrapParts.push(`- Resume briefing: ~/.openclaw/harness-enforcer/runs/${active.runId}/resume-briefing.md`);
+      }
+
+      // Contract recovery: tell agent exactly what to do next
+      if (nextContractItem) {
+        bootstrapParts.push(``);
+        bootstrapParts.push(`**\u2500\u2500 NEXT CONTRACT ITEM \u2500\u2500**`);
+        bootstrapParts.push(`[${nextContractItem.id}] ${nextContractItem.description}`);
+        bootstrapParts.push(`Acceptance: ${nextContractItem.acceptanceCriteria.join("; ")}`);
+        if (nextContractItem.verifyCommand) {
+          bootstrapParts.push(`Verify: ${nextContractItem.verifyCommand}`);
+        }
       }
 
       const bootstrapMsg = bootstrapParts.filter(Boolean).join("\n");
