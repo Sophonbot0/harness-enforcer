@@ -89,7 +89,7 @@ function parseTelegramFromSessionKey(
   if (forumMatch) return { chatId: forumMatch[1], threadId: forumMatch[2] };
   const groupMatch = sessionKey.match(/telegram:group:([-\d]+)$/);
   if (groupMatch) return { chatId: groupMatch[1] };
-  const dmMatch = sessionKey.match(/telegram:dm:([-\d]+)/);
+  const dmMatch = sessionKey.match(/telegram:(?:dm|direct):([-\d]+)/);
   if (dmMatch) return { chatId: dmMatch[1] };
   return null;
 }
@@ -145,11 +145,24 @@ export default {
       text: string,
     ): Promise<boolean> {
       try {
-        await api.runtime.channel.telegram.conversationActions.editMessage(
-          chatId,
-          messageId,
-          text,
-        );
+        const fn = api.runtime?.channel?.telegram?.conversationActions?.editMessage;
+        if (!fn || typeof fn !== 'function') {
+          api.logger.warn(
+            `[harness-enforcer] editProgressBar: editMessage not available (type=${typeof fn})`,
+          );
+          return true; // Don't clear messageId
+        }
+        const timeoutMs = 15_000;
+        const result = await Promise.race([
+          fn(chatId, messageId, text),
+          new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), timeoutMs)),
+        ]);
+        if (result === 'timeout') {
+          api.logger.warn(
+            `[harness-enforcer] editProgressBar: timed out after ${timeoutMs}ms`,
+          );
+          return true; // Transient, keep trying
+        }
         return true;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -175,18 +188,36 @@ export default {
       runId: string,
     ): Promise<void> {
       try {
+        const fn = api.runtime?.channel?.telegram?.sendMessageTelegram;
+        if (!fn || typeof fn !== 'function') {
+          api.logger.warn(
+            `[harness-enforcer] sendProgressBar: sendMessageTelegram not available (type=${typeof fn})`,
+          );
+          return;
+        }
         api.logger.info(
           `[harness-enforcer] sendProgressBar: chatId=${chatId} threadId=${threadId ?? 'none'}`,
         );
-        const result = await api.runtime.channel.telegram.sendMessageTelegram(
-          chatId,
-          text,
-          {
-            ...(threadId ? { messageThreadId: parseInt(threadId, 10) } : {}),
-          },
-        );
-        api.logger.debug(
-          `[harness-enforcer] sendProgressBar result: ${JSON.stringify(result)?.slice(0, 200)}`,
+        // Wrap in timeout to avoid hanging forever
+        const timeoutMs = 15_000;
+        const result = await Promise.race([
+          fn(
+            chatId,
+            text,
+            {
+              ...(threadId ? { messageThreadId: parseInt(threadId, 10) } : {}),
+            },
+          ),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+        ]);
+        if (result === null) {
+          api.logger.warn(
+            `[harness-enforcer] sendProgressBar: timed out after ${timeoutMs}ms`,
+          );
+          return;
+        }
+        api.logger.info(
+          `[harness-enforcer] sendProgressBar result: ${JSON.stringify(result)?.slice(0, 300)}`,
         );
         if (result?.messageId) {
           runState.telegramMessageId = String(result.messageId);

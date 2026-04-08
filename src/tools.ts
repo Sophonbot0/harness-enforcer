@@ -19,6 +19,19 @@ function jsonResult(payload: unknown): {
   };
 }
 
+function parseTelegramSessionKey(
+  sessionKey: string | undefined,
+): { chatId: string; threadId?: string } | null {
+  if (!sessionKey) return null;
+  const forumMatch = sessionKey.match(/telegram:group:([-\d]+):topic:(\d+)/);
+  if (forumMatch) return { chatId: forumMatch[1], threadId: forumMatch[2] };
+  const groupMatch = sessionKey.match(/telegram:group:([-\d]+)$/);
+  if (groupMatch) return { chatId: groupMatch[1] };
+  const dmMatch = sessionKey.match(/telegram:(?:dm|direct):([-\d]+)/);
+  if (dmMatch) return { chatId: dmMatch[1] };
+  return null;
+}
+
 function elapsedSeconds(startedAt: string): number {
   return Math.round((Date.now() - new Date(startedAt).getTime()) / 1000);
 }
@@ -96,11 +109,21 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
         const sessionKey = sessionCtx.currentSessionKey;
         // When Telegram params are explicitly provided, derive session key from them
         // (more reliable than ctx.sessionKey which may come from cron/subagent context)
+        // Also try to parse Telegram IDs from sessionKey when params not provided
+        let resolvedChatId = telegramChatId;
+        let resolvedThreadId = telegramThreadId;
+        if (!resolvedChatId && sessionKey) {
+          const parsed = parseTelegramSessionKey(sessionKey);
+          if (parsed) {
+            resolvedChatId = parsed.chatId;
+            resolvedThreadId = resolvedThreadId || parsed.threadId;
+          }
+        }
         const effectiveSessionKey = 
-          (telegramChatId && telegramThreadId 
-            ? `agent:main:telegram:group:${telegramChatId}:topic:${telegramThreadId}`
-            : telegramChatId 
-              ? `agent:main:telegram:direct:${telegramChatId}`
+          (resolvedChatId && resolvedThreadId 
+            ? `agent:main:telegram:group:${resolvedChatId}:topic:${resolvedThreadId}`
+            : resolvedChatId 
+              ? `agent:main:telegram:direct:${resolvedChatId}`
               : null)
           || sessionKey;
         const active = state.findActiveRunForSession(runsDir, effectiveSessionKey);
@@ -138,8 +161,8 @@ export function createHarnessStartTool(runsDir: string, sessionCtx: SessionConte
           checkpoints: [],
           status: "active",
           ...(effectiveSessionKey ? { sessionKey: effectiveSessionKey } : {}),
-          ...(telegramChatId ? { telegramChatId } : {}),
-          ...(telegramThreadId ? { telegramThreadId } : {}),
+          ...(resolvedChatId ? { telegramChatId: resolvedChatId } : {}),
+          ...(resolvedThreadId ? { telegramThreadId: resolvedThreadId } : {}),
           ...(verifyCommand ? { verifyCommand } : {}),
           ...(parentRunId ? { parentRunId } : {}),
           ...(isSubagent ? { isSubagent: true } : {}),
