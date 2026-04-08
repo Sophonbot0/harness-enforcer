@@ -696,8 +696,18 @@ export default {
             }
           }
         } catch {
+          api.logger.warn(`[harness-enforcer] Failed to extract payload from ${event.toolName} result`);
           return;
         }
+
+        if (!payload) {
+          api.logger.warn(`[harness-enforcer] No payload extracted from ${event.toolName} result. result keys=${Object.keys(event.result ?? {}).join(',')}`);
+          return;
+        }
+
+        api.logger.info(
+          `[harness-enforcer] ${event.toolName} payload: hasProgressBar=${!!payload.progressBar} chatId=${payload.telegramChatId ?? 'none'} runId=${payload.runId ?? 'none'}`,
+        );
 
         // ── harness_reset: delete the Telegram message instead of editing ──
         if (event.toolName === "harness_reset" && payload?.telegramDeleteOnReset) {
@@ -736,8 +746,10 @@ export default {
           return;
         }
 
-        if (!payload?.progressBar || typeof payload.progressBar !== "string")
+        if (!payload?.progressBar || typeof payload.progressBar !== "string") {
+          api.logger.info(`[harness-enforcer] No progressBar in payload for ${event.toolName}`);
           return;
+        }
 
         const progressBar = payload.progressBar as string;
 
